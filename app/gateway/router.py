@@ -6,17 +6,21 @@ The agentic loop delegates to:
   - prompt_builder.py  — system prompt cache, tool definitions
   - tool_handler.py    — injection detection, skill parsing/execution, response cleaning
   - retrieval.py       — RAG context injection, prefetch, writer intercept, memory
+  - query_classifier.py — lightweight query classification for retrieval gating
+  - token_tracker.py   — per-call token usage logging and cost estimation
 
 Agentic loop (per OpenCLAW pattern, adapted for Python / Ollama):
   1. Prompt-injection guard
   2. Load or create session
-  3. Get system prompt (60 s TTL cache from memory_skill)
-  4. Prefetch cache lookup for quick context
-  5. Append user message to history
-  6. First LLM call (non-streaming — need full text to detect skill call)
-  7. If response contains a fenced JSON skill call: execute skill, re-prompt
-  8. Stream final response to caller
-  9. Persist session; at every 10th exchange trigger async memory consolidation
+  3. Classify query (simple_chat / knowledge / document_gen / cross_archive)
+  4. Get system prompt (hash-based cache — identical across calls for prefix caching)
+  5. Prefetch cache lookup for quick context
+  6. Append user message to history (with RAG context gated by query class)
+  7. First LLM call (non-streaming — need full text to detect skill call)
+  8. If response contains a fenced JSON skill call: execute skill, re-prompt
+  9. Stream final response to caller
+ 10. Log token usage and estimated cost
+ 11. Persist session; at every 10th exchange trigger async memory consolidation
 """
 import asyncio
 import json
@@ -36,7 +40,9 @@ from app.gateway.prompt_builder import (
     _PROMPT_CACHE,
     build_tool_definitions,
     get_system_prompt,
+    get_prompt_cache_info,
 )
+from app.gateway.query_classifier import QueryClass, classify_query
 from app.gateway.retrieval import (
     build_rag_context,
     check_prefetch,
@@ -45,6 +51,11 @@ from app.gateway.retrieval import (
     handle_writer_intercept,
 )
 from app.gateway.session import Session, SessionManager
+from app.gateway.token_tracker import (
+    check_daily_cost_alert,
+    get_today_usage,
+    log_token_usage,
+)
 from app.gateway.tool_handler import (
     MAX_TOOL_ROUNDS,
     clean_llm_response,
@@ -68,8 +79,8 @@ log = logging.getLogger(__name__)
 
 class AgentRouter:
     """
-    Orchestrates the full agentic turn: guard → session → prompt → LLM → skill
-    → final response → persist → optional consolidation.
+    Orchestrates the full agentic turn: guard → session → classify → prompt →
+    LLM → skill → final response → token tracking → persist → consolidation.
 
     Intended to be instantiated once (module-level singleton via _get_router()).
     """
@@ -166,14 +177,20 @@ class AgentRouter:
         # ── 2. Session ───────────────────────────────────────────────────────
         session = self._sessions.load_or_create(user_id, role)
 
-        # ── 3. System prompt (60 s TTL cache) ────────────────────────────────
+        # ── 3. Classify query (Measure 3) ────────────────────────────────────
+        query_class = classify_query(message)
+        log.info("Query classified: class=%s message=%s", query_class, message[:60])
+
+        # ── 4. System prompt (hash-based cache — Measure 1) ──────────────────
         system_prompt = await get_system_prompt(role, self.memory_skill, self.skills)
 
         log.info("System prompt loaded, making LLM call")
-        # ── 4. Prefetch cache ────────────────────────────────────────────────
-        prefetch_ctx = check_prefetch(message)
+        # ── 5. Prefetch cache ────────────────────────────────────────────────
+        prefetch_ctx = ""
+        if query_class != QueryClass.SIMPLE_CHAT:
+            prefetch_ctx = check_prefetch(message)
 
-        # ── 5. Append user message (RAG context merged in below) ─────────────
+        # ── 6. Append user message (RAG context merged in below) ─────────────
         user_content = message
         if prefetch_ctx:
             user_content = (
@@ -181,17 +198,21 @@ class AgentRouter:
                 f"[Relevant pre-loaded context]\n{prefetch_ctx}"
             )
 
-        # ── 5a. Parent-child RAG injection ───────────────────────────────────
-        user_content, _rag_injected = await build_rag_context(message, user_content)
+        # ── 6a. Parent-child RAG injection (gated by query class) ────────────
+        user_content, _rag_injected = await build_rag_context(
+            message, user_content,
+            session_id=session.session_id,
+            query_class=query_class,
+        )
 
         self._current_role = role
         session.messages.append({"role": "user", "content": user_content,
                                    "_ts": datetime.now(timezone.utc).isoformat()})
 
-        # ── 5b. Direct writer skill intercept ────────────────────────────────
+        # ── 6b. Direct writer skill intercept ────────────────────────────────
         await handle_writer_intercept(message, role, self.skills, session)
 
-        # ── 6–8. LLM → optional skill → final response ──────────────────────
+        # ── 7–9. LLM → optional skill → final response ──────────────────────
         response_text = ""
         skill_used = ""
 
@@ -210,7 +231,7 @@ class AgentRouter:
             first_content = first_result.get("content", "")
             tool_calls = first_result.get("tool_calls", [])
 
-            # ── 7. Tool call detection ───────────────────────────────────────
+            # ── 8. Tool call detection ───────────────────────────────────────
             log.info("LLM first response: content=%s tool_calls=%s",
                      (first_content or "")[:200],
                      [tc["name"] for tc in tool_calls])
@@ -267,7 +288,7 @@ class AgentRouter:
             )
             response_text = f"[LLM ERROR: {exc}]"
 
-        # ── 9. Persist session ───────────────────────────────────────────────
+        # ── 10. Persist session ──────────────────────────────────────────────
         if response_text:
             session.messages.append(
                 {"role": "assistant", "content": response_text,
@@ -276,12 +297,39 @@ class AgentRouter:
         session.exchange_count += 1
         self._sessions.save(session)
 
-        # ── Memory consolidation every 10 exchanges ──────────────────────────
+        # ── 11. Check daily cost alert (async, non-blocking) ─────────────────
+        asyncio.create_task(self._check_cost_alert(), name="cost-alert-check")
+
+        # ── 12. Memory consolidation every 10 exchanges ──────────────────────
         if session.exchange_count > 0 and session.exchange_count % 10 == 0:
             asyncio.create_task(
                 consolidate_memory(session, self.llm, self.memory_skill),
                 name=f"consolidate-{session.session_id}-{session.exchange_count}",
             )
+
+    # ── Cost alert check ──────────────────────────────────────────────────────
+
+    async def _check_cost_alert(self):
+        """Check daily cost and post alert if over threshold."""
+        try:
+            alert = await check_daily_cost_alert()
+            if alert:
+                log.warning("COST ALERT: %s", alert)
+                # Post to noticeboard via shared_messages
+                try:
+                    from app.storage.audit_log import _adb, _ts
+                    async with _adb() as conn:
+                        await conn.execute(
+                            "INSERT INTO shared_messages "
+                            "(ts, username, display_name, role, msg_type, content) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (_ts(), "system", "CDCN Agent", "system", "alert", alert),
+                        )
+                        await conn.commit()
+                except Exception:
+                    pass  # Best-effort
+        except Exception:
+            pass  # Never let cost checks break the main flow
 
     # ── Tool call handlers (extracted from handle_message for readability) ───
 
@@ -521,7 +569,7 @@ async def chat_endpoint(
     Stream a response from the agent.
 
     Internally runs the full agentic loop:
-    injection guard → session → skill detection → LLM → persist.
+    injection guard → session → classify → skill detection → LLM → persist.
     """
     agent = _get_agent_router()
     uid = body.user_id or current_user.username
@@ -544,6 +592,22 @@ async def chat_endpoint(
 @gateway_router.get("/status", tags=["gateway"])
 async def gateway_status():
     return state.status()
+
+
+# ── /usage — Token usage and cost tracking (Measure 4) ──────────────────────
+
+
+@gateway_router.get("/usage", tags=["gateway"])
+async def usage_endpoint(current_user: User = Depends(get_current_user)):
+    """
+    Return today's token usage breakdown and estimated cost.
+
+    Includes totals, breakdown by query class, and breakdown by user.
+    """
+    usage = await get_today_usage()
+    prompt_info = get_prompt_cache_info()
+    usage["prompt_cache"] = prompt_info
+    return usage
 
 
 # ── Session HTTP endpoints ───────────────────────────────────────────────────

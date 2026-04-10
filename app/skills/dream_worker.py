@@ -162,6 +162,14 @@ class DreamWorkerSkill(BaseSkill):
             json.dumps({"duration_ms": cycle_dur_ms, "tasks": len(outcomes)}),
         )
 
+        # Invalidate system prompt cache after dream cycle
+        # (learned_skills may have changed)
+        try:
+            from app.gateway.prompt_builder import invalidate_prompt_cache
+            invalidate_prompt_cache()
+        except Exception:
+            pass
+
         # Log a structured dream-cycle record (used by AuditLog.log_dream_cycle callers)
         try:
             if hasattr(self._audit, "log_dream_cycle"):

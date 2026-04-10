@@ -220,6 +220,13 @@ class DocumentIndexerSkill(BaseSkill):
             except Exception as exc:
                 log.warning("Failed to rebuild document index: %s", exc)
 
+            # Invalidate system prompt cache so the new doc index is picked up
+            try:
+                from app.gateway.prompt_builder import invalidate_prompt_cache
+                invalidate_prompt_cache()
+            except Exception:
+                pass
+
         return SkillResult(
             success=True,
             output=summary,

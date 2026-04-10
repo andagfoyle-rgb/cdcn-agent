@@ -2,7 +2,18 @@
 Retrieval and context augmentation — RAG injection, prefetch cache, writer
 intercept, identity linking, and memory consolidation.
 
-Extracted from router.py to keep the AgentRouter class focused on orchestration.
+Cost-reduction measures 2 & 3:
+
+Measure 2 — Smart context loading:
+  - Track which documents have been loaded in the current session.
+  - On follow-up messages, reuse already-loaded context instead of re-fetching.
+  - Enforce per-query token budgets based on query classification.
+
+Measure 3 — Query classification before retrieval:
+  - SIMPLE_CHAT (greetings, thanks, yes/no): skip retrieval entirely.
+  - KNOWLEDGE (factual questions): targeted retrieval, max ~50K tokens.
+  - DOCUMENT_GEN (draft/write): relevant docs, max ~100K tokens.
+  - CROSS_ARCHIVE (broad search): full retrieval, max ~125K tokens.
 """
 from __future__ import annotations
 
@@ -12,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app.config import settings
+from app.gateway.query_classifier import QueryClass, TOKEN_BUDGETS, classify_query
 
 if TYPE_CHECKING:
     from app.gateway.session import Session
@@ -19,6 +31,34 @@ if TYPE_CHECKING:
     from app.skills.base import BaseSkill
 
 log = logging.getLogger(__name__)
+
+
+# ── Session-level document tracking ──────────────────────────────────────────
+# Maps session_id -> set of document citations already loaded in this session.
+# Also tracks the full RAG context string so follow-ups can reuse it.
+
+_session_loaded_docs: dict[str, set[str]] = {}
+_session_rag_context: dict[str, str] = {}
+_session_query_count: dict[str, int] = {}
+
+# Maximum sessions to track (prevent unbounded growth)
+_MAX_TRACKED_SESSIONS = 50
+
+
+def _cleanup_session_tracking():
+    """Evict oldest sessions if tracking exceeds limit."""
+    if len(_session_loaded_docs) > _MAX_TRACKED_SESSIONS:
+        # Remove half the entries (oldest by insertion order)
+        to_remove = list(_session_loaded_docs.keys())[:_MAX_TRACKED_SESSIONS // 2]
+        for sid in to_remove:
+            _session_loaded_docs.pop(sid, None)
+            _session_rag_context.pop(sid, None)
+            _session_query_count.pop(sid, None)
+
+
+def get_session_query_class(session_id: str, message: str) -> str:
+    """Classify query and return the class. Exported for use by router."""
+    return classify_query(message)
 
 
 # ── Prefetch cache ───────────────────────────────────────────────────────────
@@ -77,13 +117,28 @@ _QUESTION_WORDS = (
 )
 
 
-async def build_rag_context(message: str, user_content: str) -> tuple[str, bool]:
+async def build_rag_context(
+    message: str,
+    user_content: str,
+    session_id: str = "",
+    query_class: str = "",
+) -> tuple[str, bool]:
     """
-    Augment user_content with RAG-retrieved documents if the message appears
-    to need document context.
+    Augment user_content with RAG-retrieved documents if the message needs
+    document context.
+
+    Cost-reduction measures applied:
+    1. Skip retrieval entirely for SIMPLE_CHAT queries.
+    2. Reuse already-loaded context for follow-up queries in the same session.
+    3. Enforce per-query token budgets based on query classification.
 
     Returns (augmented_content, rag_injected).
     """
+    # ── Measure 3: Skip retrieval for simple chat ────────────────────────
+    if query_class == QueryClass.SIMPLE_CHAT:
+        log.info("RAG skipped: query classified as simple_chat")
+        return user_content, False
+
     _msg_lower = message.lower().strip()
     _is_question = (
         "?" in message
@@ -92,7 +147,43 @@ async def build_rag_context(message: str, user_content: str) -> tuple[str, bool]
     )
     _needs_rag = _is_question or any(k in _msg_lower for k in _DOC_KEYWORDS)
     if not _needs_rag:
+        log.info("RAG skipped: no document keywords detected")
         return user_content, False
+
+    # ── Measure 2: Check session cache for already-loaded context ────────
+    if session_id and session_id in _session_rag_context:
+        existing_context = _session_rag_context[session_id]
+        loaded_docs = _session_loaded_docs.get(session_id, set())
+
+        # Check if the follow-up question relates to already-loaded docs
+        query_words = {w.lower() for w in message.split() if len(w) > 3}
+        context_lower = existing_context.lower()
+        overlap = sum(1 for w in query_words if w in context_lower)
+
+        if overlap >= 2 and loaded_docs:
+            # Reuse existing context — don't re-fetch
+            log.info(
+                "RAG reuse: session %s already has %d docs loaded, "
+                "%d query words overlap — reusing cached context",
+                session_id[:8], len(loaded_docs), overlap,
+            )
+            _rag_prefix = (
+                "The relevant CDCN documents have ALREADY been retrieved for this question. "
+                "DO NOT call search_archive — answer directly from the documents below. "
+                "Use specific quotes, names, dates, and figures. "
+                "CITE EVERY FACTUAL CLAIM with [Document Name, Date, Section]. "
+                "If you cannot find a citation, say so explicitly.\n\n"
+            )
+            augmented = (
+                f"{message}\n\n"
+                f"--- RETRIEVED DOCUMENTS (answer from these) ---\n\n"
+                f"{_rag_prefix}"
+                f"{existing_context}"
+            )
+            return augmented, True
+
+    # ── Get token budget for this query class ────────────────────────────
+    char_budget = TOKEN_BUDGETS.get(query_class, TOKEN_BUDGETS[QueryClass.KNOWLEDGE])
 
     try:
         from app.skills.search import search as rag_search
@@ -111,18 +202,25 @@ async def build_rag_context(message: str, user_content: str) -> tuple[str, bool]
         elif any(k in _ml for k in ["report", "trustees report", "annual report"]):
             _rag_doc_type = ["report"]
 
+        # Adjust top_k based on query class
+        top_k = 15
+        if query_class == QueryClass.KNOWLEDGE:
+            top_k = 10
+        elif query_class == QueryClass.CROSS_ARCHIVE:
+            top_k = 20
+
         # Run parent-child search with full parent context
         _search_result = await rag_search(
             query=message,
             doc_type=_rag_doc_type,
-            top_k=15,
+            top_k=top_k,
             return_parents=True,
         )
         # If typed search returned few results, also do unfiltered search
         if _rag_doc_type and len(_search_result.hits) < 5:
             _unfiltered = await rag_search(
                 query=message,
-                top_k=15,
+                top_k=top_k,
                 return_parents=True,
             )
             _seen_pids = {h.parent_id for h in _search_result.hits if h.parent_id}
@@ -150,8 +248,23 @@ async def build_rag_context(message: str, user_content: str) -> tuple[str, bool]
 
         if _search_result.hits or _journal_context:
             _context_parts = []
+            _total_chars = 0
+            _loaded_citations = set()
+
             for hit in _search_result.hits:
+                content_len = len(hit.content)
+                # ── Measure 2: Enforce token budget ──────────────────
+                if _total_chars + content_len > char_budget:
+                    log.info(
+                        "RAG budget reached: %d/%d chars, skipping remaining %d hits",
+                        _total_chars, char_budget,
+                        len(_search_result.hits) - len(_context_parts),
+                    )
+                    break
                 _context_parts.append(f"=== {hit.citation} ===\n{hit.content}")
+                _loaded_citations.add(hit.citation)
+                _total_chars += content_len
+
             _docs_context = "\n\n".join(_context_parts)
 
             # Build file list for download links
@@ -179,9 +292,20 @@ async def build_rag_context(message: str, user_content: str) -> tuple[str, bool]
                 f"{_rag_prefix}"
                 f"{_combined}"
             )
-            log.info("RAG injected: %d parent sections, %d children matched, chars=%d",
-                     len(_search_result.hits), _search_result.total_children_matched,
-                     len(_combined))
+
+            # ── Measure 2: Cache loaded docs for this session ────────
+            if session_id:
+                _cleanup_session_tracking()
+                _session_loaded_docs.setdefault(session_id, set()).update(_loaded_citations)
+                _session_rag_context[session_id] = _combined
+                _session_query_count[session_id] = _session_query_count.get(session_id, 0) + 1
+
+            log.info(
+                "RAG injected: %d parent sections, %d children matched, "
+                "chars=%d (budget=%d, class=%s)",
+                len(_search_result.hits), _search_result.total_children_matched,
+                len(_combined), char_budget, query_class,
+            )
             return augmented, True
         else:
             log.info("RAG: no relevant documents found for query")

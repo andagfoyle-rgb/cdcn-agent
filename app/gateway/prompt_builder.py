@@ -1,21 +1,45 @@
 """
 Prompt construction — system prompt cache, skills listing, and tool definitions.
 
-Extracted from router.py to keep the AgentRouter class focused on orchestration.
+Cost-reduction measure 1: The system prompt is built ONCE at startup and cached
+in memory.  It is only rebuilt when the underlying content changes (detected via
+SHA-256 hash of the concatenated source files).  This produces an IDENTICAL
+prefix string across all requests, allowing SiliconFlow's automatic prompt
+caching to kick in (cached input tokens cost 40x less than fresh input).
+
+The system prompt includes:
+  - Soul/identity (soul.md)
+  - Agent rules (agents.md)
+  - Organisation profile (org_profile.md)
+  - Learned skills from the database
+  - Skills listing (registered skill descriptions)
+
+All of these are deterministic for a given state — no timestamps, no random
+ordering.  The prompt is always sent as the FIRST message so it forms the
+cached prefix.
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+from app.config import settings
 
 if TYPE_CHECKING:
     from app.skills.base import BaseSkill
 
-# ── System-prompt cache ──────────────────────────────────────────────────────
-# Keyed by role string.  Value is (prompt_text, monotonic_timestamp).
+log = logging.getLogger(__name__)
 
-_PROMPT_CACHE: dict[str, tuple[str, float]] = {}
-_PROMPT_CACHE_TTL = 60.0  # seconds
+# ── Cached prompt state ──────────────────────────────────────────────────────
+
+_cached_prompt: str = ""
+_cached_prompt_hash: str = ""
+_cached_prompt_ts: float = 0.0
+_HASH_CHECK_INTERVAL = 300.0  # Check for changes every 5 minutes (not every call)
+
 
 # ── Constants injected into prompts ──────────────────────────────────────────
 
@@ -41,37 +65,56 @@ VERIFICATION_PROMPT = (
     "return the response unchanged. Do not add commentary."
 )
 
+# Legacy alias — some modules import this directly
+_PROMPT_CACHE: dict[str, tuple[str, float]] = {}
 
-# ── Public helpers ───────────────────────────────────────────────────────────
 
-async def get_system_prompt(role: str, memory_skill, skills: dict[str, BaseSkill]) -> str:
-    """
-    Return a system prompt for the given role.
+# ── Deterministic content builders ───────────────────────────────────────────
 
-    The prompt is assembled from:
-      - memory_skill.get_system_prompt() — soul, style guide, agent context
-      - build_skills_block()             — skill listing in canonical format
+def _read_file(path: Path) -> str:
+    """Read a file; return empty string if missing."""
+    try:
+        return path.read_text() if path.exists() else ""
+    except OSError:
+        return ""
 
-    Result is cached for _PROMPT_CACHE_TTL seconds per role to avoid
-    repeated file reads on every turn.
-    """
-    now = time.monotonic()
-    cached = _PROMPT_CACHE.get(role)
-    if cached and (now - cached[1]) < _PROMPT_CACHE_TTL:
-        return cached[0]
 
-    soul_prompt = memory_skill.get_system_prompt()
-    skills_block = build_skills_block(skills)
-    prompt = f"{soul_prompt}\n\n{skills_block}"
+def _build_learned_skills_block() -> str:
+    """Load learned skills from the DB deterministically (sorted by name)."""
+    try:
+        import sqlite3
+        db_path = settings.audit_log_path
+        if not Path(db_path).exists():
+            return ""
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT skill_name, description FROM learned_skills "
+                "ORDER BY skill_name, id"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return ""
+        finally:
+            conn.close()
 
-    _PROMPT_CACHE[role] = (prompt, now)
-    return prompt
+        if not rows:
+            return ""
+
+        lines = ["## Learned Behaviours", ""]
+        for name, desc in rows:
+            # Truncate long descriptions for prompt efficiency
+            short_desc = desc.strip()[:200]
+            lines.append(f"- **{name}**: {short_desc}")
+        return "\n".join(lines)
+    except Exception as exc:
+        log.debug("Could not load learned skills: %s", exc)
+        return ""
 
 
 def build_skills_block(skills: dict[str, BaseSkill]) -> str:
     """
     Build the skills listing injected into every system prompt.
-    Simplified for function calling — no raw JSON format instructions needed.
+    Deterministic: skills sorted by name.
     """
     lines = [
         "## Available Skills",
@@ -79,13 +122,90 @@ def build_skills_block(skills: dict[str, BaseSkill]) -> str:
         "You have access to the following tools/skills via function calling:",
         "",
     ]
-    for name, skill in skills.items():
+    for name in sorted(skills.keys()):
+        skill = skills[name]
         lines.append(f"- **{name}**: {skill.description}")
     lines += [
         "",
         "Use function calling when a skill is needed. Do not output raw JSON skill calls.",
     ]
     return "\n".join(lines)
+
+
+def _compute_prompt_hash(parts: list[str]) -> str:
+    """SHA-256 hash of concatenated prompt parts."""
+    combined = "\n".join(parts)
+    return hashlib.sha256(combined.encode()).hexdigest()[:16]
+
+
+# ── Public helpers ───────────────────────────────────────────────────────────
+
+async def get_system_prompt(role: str, memory_skill, skills: dict[str, BaseSkill]) -> str:
+    """
+    Return the cached system prompt, rebuilding only if source content has changed.
+
+    The prompt is identical across calls with the same underlying content,
+    enabling SiliconFlow's automatic prompt prefix caching.
+    """
+    global _cached_prompt, _cached_prompt_hash, _cached_prompt_ts
+
+    now = time.monotonic()
+
+    # Only check for changes periodically, not every call
+    if _cached_prompt and (now - _cached_prompt_ts) < _HASH_CHECK_INTERVAL:
+        return _cached_prompt
+
+    # Read all source parts
+    from app.skills.memory import SOUL_FILE, AGENTS_FILE, ORG_PROFILE_FILE
+    soul = _read_file(SOUL_FILE).strip()
+    agents = _read_file(AGENTS_FILE).strip()
+    org = _read_file(ORG_PROFILE_FILE).strip()
+    learned = _build_learned_skills_block()
+    skills_block = build_skills_block(skills)
+
+    parts = [soul, agents, org, learned, skills_block]
+    new_hash = _compute_prompt_hash(parts)
+
+    # If hash unchanged, just update timestamp and return cached
+    if new_hash == _cached_prompt_hash and _cached_prompt:
+        _cached_prompt_ts = now
+        return _cached_prompt
+
+    # Rebuild prompt
+    identity_parts = [p for p in [soul, agents, org] if p]
+    identity = "\n\n---\n\n".join(identity_parts) if identity_parts else "(no identity context loaded)"
+
+    prompt_sections = [identity]
+    if learned:
+        prompt_sections.append(learned)
+    prompt_sections.append(skills_block)
+
+    _cached_prompt = "\n\n".join(prompt_sections)
+    _cached_prompt_hash = new_hash
+    _cached_prompt_ts = now
+
+    log.info("System prompt rebuilt (hash=%s, len=%d chars)", new_hash, len(_cached_prompt))
+    return _cached_prompt
+
+
+def invalidate_prompt_cache():
+    """
+    Force a rebuild of the system prompt on next call.
+    Call this after indexing, dream mode, or learned_skills changes.
+    """
+    global _cached_prompt_hash, _cached_prompt_ts
+    _cached_prompt_hash = ""
+    _cached_prompt_ts = 0.0
+    log.info("System prompt cache invalidated")
+
+
+def get_prompt_cache_info() -> dict:
+    """Return info about the current prompt cache state (for diagnostics)."""
+    return {
+        "hash": _cached_prompt_hash,
+        "length": len(_cached_prompt),
+        "age_seconds": round(time.monotonic() - _cached_prompt_ts, 1) if _cached_prompt_ts else None,
+    }
 
 
 def build_tool_definitions(skills: dict[str, BaseSkill]) -> list[dict]:

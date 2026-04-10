@@ -116,6 +116,20 @@ class CDCNLLMClient:
         except Exception as exc:
             log.warning("Audit log write failed: %s", exc)
 
+        # Measure 4: Log to token_usage table for cost tracking
+        try:
+            from app.gateway.token_tracker import log_token_usage
+            await log_token_usage(
+                user_id=user_id,
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                cached_tokens=0,  # SiliconFlow doesn't report cached tokens separately yet
+                model=self.model,
+                skill_used=skill_used,
+            )
+        except Exception:
+            pass  # Never let tracking break the main flow
+
     async def chat_stream(self, messages, system_prompt=None, skill_used="", user_id="", role=""):
         payload = {"model": self.model, "messages": self._build_messages(messages, system_prompt), "stream": True, "max_tokens": 4096}
         t0 = time.monotonic()
