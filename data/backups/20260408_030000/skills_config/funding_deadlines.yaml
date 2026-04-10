@@ -1,0 +1,18 @@
+---
+# Funding Deadlines
+# Format: funder, program, deadline (YYYY-MM-DD), amount, status, notes
+
+deadlines:
+  - funder: ""
+    program: ""
+    deadline: ""
+    amount: ""
+    status: "upcoming"  # upcoming | in-progress | submitted | awarded | declined
+    notes: ""
+
+# Statuses
+# upcoming    — not yet started
+# in-progress — draft underway
+# submitted   — application sent
+# awarded     — funding confirmed
+# declined    — not funded this cycle

@@ -1,0 +1,1119 @@
+"""
+DreamWorkerSkill — six overnight consolidation tasks run during DREAM mode.
+
+Architecture adapted from OpenCLAW's heartbeat runner:
+  - Tasks run sequentially; one failure never aborts the rest of the cycle.
+  - All LLM-generated proposals are written to pending_changes/ for human review.
+    Nothing is auto-applied to identity or configuration files.
+  - The small local model (dream_chat / DREAM_OLLAMA_BASE_URL + DREAM_MODEL)
+    is used for all inference so the Pi 5 can work without waking the R710.
+  - Start/end time and per-task outcomes are written to audit_log.
+  - A full cycle summary is written to the dream journal via memory_skill.
+
+Dependency injection mirrors OpenCLAW's cron-isolated-agent pattern: all
+dependencies are passed at construction time so the worker can be unit-tested
+and the dream-mode endpoint is explicit rather than implicit.
+"""
+import asyncio
+import json
+import logging
+import random
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from app.config import settings
+from app.llm_client import dream_chat  # noqa: F401 – imported for module-level patching in tests
+from app.skills.base import BaseSkill, SkillResult
+
+log = logging.getLogger(__name__)
+
+# ── File-level locks — prevent concurrent writes to shared files ─────────────
+# Used by dream_worker tasks AND scheduler jobs that may overlap.
+_file_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_file_lock(path: str | Path) -> asyncio.Lock:
+    """Return a per-path asyncio.Lock (created on first use)."""
+    key = str(path)
+    if key not in _file_locks:
+        _file_locks[key] = asyncio.Lock()
+    return _file_locks[key]
+
+# ── Static paths ──────────────────────────────────────────────────────────────
+
+_KNOWLEDGE_GRAPH_FILE = Path("skills_config/memory/knowledge_graph.md")
+
+# ── Heuristic correction phrases (Task 2) ─────────────────────────────────────
+
+_CORRECTION_PHRASES = [
+    "actually,",
+    "that's wrong",
+    "thats wrong",
+    "no, i meant",
+    "no i meant",
+    "not quite",
+    "you misunderstood",
+    "that's not right",
+    "thats not right",
+    "i didn't mean",
+    "i meant",
+    "wrong —",
+    "wrong,",
+    "that wasn't",
+]
+
+# ── Task outcome record ───────────────────────────────────────────────────────
+
+
+@dataclass
+class _TaskOutcome:
+    task: str
+    success: bool
+    summary: str
+    error: str = ""
+    duration_ms: int = 0
+
+
+# ── Private helpers ───────────────────────────────────────────────────────────
+
+
+def _session_transcript(session) -> str:
+    """Format a Session's messages list as a readable conversation string."""
+    lines = []
+    for msg in session.messages:
+        role = msg.get("role", "user").capitalize()
+        content = msg.get("content", "").strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
+def _is_correction(text: str) -> bool:
+    lower = text.lower()
+    return any(phrase in lower for phrase in _CORRECTION_PHRASES)
+
+
+def _truncate(text: str, max_chars: int = 3000) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n…[truncated]"
+
+
+def _read_optional(path: Path) -> str:
+    try:
+        return path.read_text() if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def _extract_section(text: str, header: str) -> str:
+    """Extract body text between a '## HEADER' and the next '## ' or EOF."""
+    pattern = re.escape(header) + r"\s*\n(.*?)(?=\n##\s|\Z)"
+    match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+# ── DreamWorkerSkill ──────────────────────────────────────────────────────────
+
+
+class DreamWorkerSkill(BaseSkill):
+    """
+    Five overnight consolidation tasks.
+
+    Constructor takes explicit dependencies so the dream-mode LLM endpoint
+    is wired at construction time and tests can inject mocks.
+
+    Parameters
+    ----------
+    llm_client     CDCNLLMClient configured for DREAM_OLLAMA_BASE_URL + DREAM_MODEL
+    memory_skill   MemorySkill instance
+    vector_store   CDCNVectorStore instance
+    session_manager  SessionManager instance
+    pending_changes  app.storage.pending_changes module (or compatible object)
+    audit_log        app.storage.audit_log module (or compatible object)
+    """
+
+    name = "dream_worker"
+    description = "Six overnight consolidation tasks run during DREAM mode."
+
+    def __init__(
+        self,
+        llm_client,
+        memory_skill,
+        vector_store,
+        session_manager,
+        pending_changes,
+        audit_log,
+        settings=None,  # accepted for API compat; module-level settings used
+    ) -> None:
+        self._llm = llm_client
+        self._memory = memory_skill
+        self._vs = vector_store
+        self._sessions = session_manager
+        self._session_manager = session_manager  # alias for test access
+        self._pending = pending_changes
+        self._pending_changes = pending_changes   # alias for test access
+        self._audit = audit_log
+        self._audit_log_mod = audit_log  # module reference for log_learned_skill
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    async def run(self, task: str = "full_cycle", **kwargs) -> SkillResult:
+        if task == "full_cycle":
+            return await self.run_full_cycle()
+        # Backward-compat shims so the old state_manager calls still work
+        if task == "prefetch":
+            return await self._prefetch_compat()
+        if task == "summarize_pending":
+            return await self._summarize_pending_compat()
+        return SkillResult(success=False, error=f"Unknown dream task: {task}")
+
+    async def run_full_cycle(self) -> SkillResult:
+        """
+        Run all five tasks in sequence.
+
+        Per-task try/except means one failure never aborts the cycle.
+        Outcomes are logged to audit_log and summarised in the dream journal.
+        """
+        cycle_start = time.monotonic()
+        cycle_start_ts = datetime.now(timezone.utc).isoformat()
+        outcomes: list[_TaskOutcome] = []
+
+        await self._audit_event("cycle_start", cycle_start_ts)
+
+        tasks = [
+            ("consolidate_memory", self.consolidate_memory),
+            ("self_critique", self.self_critique),
+            ("learn_from_interactions", self.learn_from_interactions),
+            ("map_document_relationships", self.map_document_relationships),
+            ("anticipate_tomorrow", self.anticipate_tomorrow),
+            ("refine_style_guide", self.refine_style_guide),
+        ]
+
+        for task_name, task_fn in tasks:
+            t0 = time.monotonic()
+            log.info("Dream cycle: starting %s", task_name)
+            try:
+                outcome = await task_fn()
+                if not isinstance(outcome, _TaskOutcome):
+                    # Handles mock objects / None returned by patched methods in tests
+                    outcome = _TaskOutcome(task=task_name, success=True, summary="(mocked)")
+                outcome.duration_ms = int((time.monotonic() - t0) * 1000)
+            except Exception as exc:  # noqa: BLE001
+                log.error("Dream cycle task %s raised unexpectedly: %s", task_name, exc)
+                outcome = _TaskOutcome(
+                    task=task_name,
+                    success=False,
+                    summary="",
+                    error=str(exc),
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                )
+            outcomes.append(outcome)
+            log.info(
+                "Dream cycle: %s — success=%s (%dms): %s",
+                task_name, outcome.success, outcome.duration_ms,
+                outcome.summary or outcome.error,
+            )
+            await self._audit_event(
+                f"task_{task_name}",
+                json.dumps({
+                    "success": outcome.success,
+                    "duration_ms": outcome.duration_ms,
+                    "summary": outcome.summary[:200],
+                    "error": outcome.error[:200] if outcome.error else "",
+                }),
+            )
+
+        # Write dream journal
+        cycle_dur_ms = int((time.monotonic() - cycle_start) * 1000)
+        journal_text = self._build_cycle_summary(outcomes, cycle_start_ts, cycle_dur_ms)
+        try:
+            self._memory.write_dream_journal(content=journal_text)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Dream journal write failed: %s", exc)
+
+        await self._audit_event(
+            "cycle_end",
+            json.dumps({"duration_ms": cycle_dur_ms, "tasks": len(outcomes)}),
+        )
+
+        # Log a structured dream-cycle record (used by AuditLog.log_dream_cycle callers)
+        try:
+            if hasattr(self._audit, "log_dream_cycle"):
+                await self._audit.log_dream_cycle(
+                    start=cycle_start_ts,
+                    end=datetime.now(timezone.utc).isoformat(),
+                    tasks_completed=sum(1 for o in outcomes if o.success),
+                    tasks_failed=sum(1 for o in outcomes if not o.success),
+                    summary=journal_text[:500],
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("log_dream_cycle failed: %s", exc)
+
+        return SkillResult(
+            success=all(o.success for o in outcomes),
+            output=journal_text,
+            metadata={
+                "outcomes": [
+                    {
+                        "task": o.task,
+                        "success": o.success,
+                        "duration_ms": o.duration_ms,
+                        "summary": o.summary,
+                    }
+                    for o in outcomes
+                ]
+            },
+        )
+
+    # ── Task 1: consolidate_memory ─────────────────────────────────────────────
+
+    async def consolidate_memory(self) -> _TaskOutcome:
+        """
+        Read yesterday's sessions and distil key findings into memory.md sections.
+        Tags each update with the source date and 'auto-consolidated'.
+
+        Note: this runs after midnight (01:00–02:00 UTC) so we look at
+        *yesterday's* sessions, not today's.  Falls back to today if
+        yesterday has none (e.g. manual daytime run).
+        """
+        sessions = self._sessions.get_yesterday_sessions()
+        if not sessions:
+            # Fallback: maybe running during the day for testing
+            sessions = self._sessions.get_today_sessions()
+        if not sessions:
+            return _TaskOutcome(
+                task="consolidate_memory",
+                success=True,
+                summary="No sessions today — nothing to consolidate.",
+            )
+
+        transcripts = []
+        for s in sessions:
+            t = _session_transcript(s)
+            if t.strip():
+                transcripts.append(f"[Session {s.session_id[:8]}]\n{t}")
+
+        if not transcripts:
+            return _TaskOutcome(
+                task="consolidate_memory",
+                success=True,
+                summary="Sessions present but no message content found.",
+            )
+
+        combined = _truncate("\n\n---\n\n".join(transcripts), max_chars=6000)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        prompt = (
+            "You are analysing conversations with CDCN Agent, an AI assistant for "
+            "Community Development Company Nesting (CDCN), a Scottish charitable organisation "
+            "in South Nesting, Shetland.\n\n"
+            "Review the following conversation transcripts from today and identify:\n\n"
+            "1. REPEATED TOPICS: Topics or questions that came up more than once\n"
+            "2. STRUGGLED QUESTIONS: Questions the agent appeared to answer poorly or "
+            "that required follow-up clarification\n"
+            "3. FREQUENTLY REFERENCED DOCUMENTS: Specific documents or files mentioned repeatedly\n"
+            "4. NEW CDCN FACTS: New facts about CDCN's projects, context, or working practices "
+            "that should be retained\n\n"
+            "Format your response as:\n\n"
+            "## REPEATED TOPICS\n- [topic]\n\n"
+            "## STRUGGLED QUESTIONS\n- [question]\n\n"
+            "## FREQUENTLY REFERENCED DOCUMENTS\n- [document]\n\n"
+            "## NEW CDCN FACTS\n- [fact]\n\n"
+            "If a category has no entries write 'None identified.'\n\n"
+            f"Transcripts:\n\n{combined}"
+        )
+
+        try:
+            response = await self._dream_call(prompt)
+        except Exception as exc:  # noqa: BLE001
+            return _TaskOutcome(
+                task="consolidate_memory",
+                success=False,
+                summary="",
+                error=f"LLM call failed: {exc}",
+            )
+
+        tag = f"(source: {today} sessions, auto-consolidated)"
+        sections_written: list[str] = []
+
+        # Map LLM output sections → memory.md sections
+        for llm_header, memory_section in [
+            ("## REPEATED TOPICS", "Recurring preferences and working style notes"),
+            ("## STRUGGLED QUESTIONS", "Things to follow up"),
+            ("## NEW CDCN FACTS", "Key decisions from recent meetings"),
+        ]:
+            block = _extract_section(response, llm_header)
+            if block and "none identified" not in block.lower():
+                result = self._memory.update_memory(memory_section, f"{block}\n\n{tag}")
+                if result.success:
+                    sections_written.append(memory_section)
+
+        return _TaskOutcome(
+            task="consolidate_memory",
+            success=True,
+            summary=(
+                f"Consolidated {len(sessions)} session(s). "
+                f"Updated: {', '.join(sections_written) or 'no sections needed update'}."
+            ),
+        )
+
+    # ── Task 2: self_critique ──────────────────────────────────────────────────
+
+    async def self_critique(self) -> _TaskOutcome:
+        """
+        Find exchanges where the agent underperformed (correction phrases,
+        short follow-up rephrases) and propose targeted amendments to agents.md.
+        All proposals go to pending_changes/ — nothing is auto-applied.
+        """
+        sessions = self._sessions.get_yesterday_sessions()
+        if not sessions:
+            sessions = self._sessions.get_today_sessions()
+        # Each item: (session_id_short, assistant_turn, user_correction)
+        critique_exchanges: list[tuple[str, str, str]] = []
+
+        for session in sessions:
+            msgs = session.messages
+            for i, msg in enumerate(msgs):
+                if msg.get("role") != "user":
+                    continue
+                content = msg.get("content", "")
+                if not _is_correction(content):
+                    continue
+                # Find the most recent preceding assistant turn
+                assistant_msg = next(
+                    (msgs[j]["content"] for j in range(i - 1, -1, -1)
+                     if msgs[j].get("role") == "assistant"),
+                    "",
+                )
+                if assistant_msg:
+                    critique_exchanges.append(
+                        (session.session_id[:8], assistant_msg, content)
+                    )
+
+        if not critique_exchanges:
+            return _TaskOutcome(
+                task="self_critique",
+                success=True,
+                summary="No critique cases found today.",
+            )
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        pending_dir = Path(settings.pending_changes_path)
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        proposals_written = 0
+
+        for n, (session_id, assistant_msg, user_correction) in enumerate(
+            critique_exchanges, start=1
+        ):
+            prompt = (
+                "You are reviewing an exchange between a user and CDCN Agent, an AI assistant "
+                "for a Scottish charitable organisation.\n\n"
+                "The user appeared to correct or express dissatisfaction with the agent's "
+                "response. What could the agent have done better?\n\n"
+                f"AGENT'S RESPONSE:\n{_truncate(assistant_msg, 1500)}\n\n"
+                f"USER'S FOLLOW-UP:\n{_truncate(user_correction, 500)}\n\n"
+                "Propose one specific amendment to the agent's operating rules that would "
+                "improve future responses. Format your response EXACTLY as:\n\n"
+                "PROBLEM: [what went wrong in 1–2 sentences]\n"
+                "PROPOSED AMENDMENT: [exact text to add or change in the agent's rules]\n"
+                "REASONING: [why this would help, in 1–2 sentences]"
+            )
+
+            try:
+                response = await self._dream_call(prompt)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("self_critique LLM call failed for exchange %d: %s", n, exc)
+                continue
+
+            proposal_path = pending_dir / f"agents_{today}_{n}.md"
+            proposal_text = (
+                f"# Proposed Amendment to agents.md\n\n"
+                f"Generated: {today}\nSession: {session_id}\nStatus: pending\n\n"
+                f"## Context\n\n"
+                f"**Agent response that prompted review:**\n{_truncate(assistant_msg, 800)}\n\n"
+                f"**User correction:**\n{_truncate(user_correction, 400)}\n\n"
+                f"## Analysis\n\n{response.strip()}\n\n"
+                f"---\n"
+                f"*Generated by DreamWorkerSkill self_critique. "
+                f"Requires human review before application.*\n"
+            )
+            try:
+                proposal_path.write_text(proposal_text)
+                self._pending.propose(
+                    title=f"agents.md amendment — {today} (session {session_id})",
+                    diff=response.strip(),
+                    author="dream_worker",
+                )
+                proposals_written += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("self_critique write failed: %s", exc)
+
+        return _TaskOutcome(
+            task="self_critique",
+            success=True,
+            summary=(
+                f"Found {len(critique_exchanges)} critique case(s). "
+                f"Wrote {proposals_written} proposal(s) to pending_changes/."
+            ),
+        )
+
+    # ── Task 3: learn_from_interactions ──────────────────────────────────────
+
+    async def learn_from_interactions(self) -> _TaskOutcome:
+        """
+        Review yesterday's conversations, extract reusable patterns and
+        approaches that worked well, and store them in the learned_skills
+        table for injection into future system prompts.
+
+        Patterns include: effective response strategies for specific question
+        types, document formats that users accepted without corrections,
+        and successful tool-use sequences.
+        """
+        from app.storage.audit_log import log_learned_skill
+
+        sessions = self._sessions.get_yesterday_sessions()
+        if not sessions:
+            sessions = self._sessions.get_today_sessions()
+        if not sessions:
+            return _TaskOutcome(
+                task="learn_from_interactions",
+                success=True,
+                summary="No sessions — nothing to learn from.",
+            )
+
+        # Build a combined transcript of successful exchanges
+        # (assistant turns that were NOT followed by a correction)
+        good_exchanges: list[str] = []
+        for session in sessions:
+            msgs = session.messages
+            for i, msg in enumerate(msgs):
+                if msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content", "").strip()
+                if not content or len(content) < 100:
+                    continue
+                # Check if the next user message is a correction
+                next_user = next(
+                    (msgs[j] for j in range(i + 1, len(msgs))
+                     if msgs[j].get("role") == "user"),
+                    None,
+                )
+                if next_user and _is_correction(next_user.get("content", "")):
+                    continue  # skip — this exchange was corrected
+                # Find the preceding user question
+                prev_user = next(
+                    (msgs[j]["content"] for j in range(i - 1, -1, -1)
+                     if msgs[j].get("role") == "user"),
+                    "",
+                )
+                if prev_user:
+                    good_exchanges.append(
+                        f"Q: {_truncate(prev_user, 300)}\n"
+                        f"A: {_truncate(content, 500)}"
+                    )
+
+        if len(good_exchanges) < 2:
+            return _TaskOutcome(
+                task="learn_from_interactions",
+                success=True,
+                summary=f"Only {len(good_exchanges)} good exchange(s) — "
+                        f"need at least 2 to extract patterns.",
+            )
+
+        combined = _truncate("\n\n---\n\n".join(good_exchanges[:20]), max_chars=6000)
+
+        prompt = (
+            "You are analysing successful conversations between a user and CDCN Agent, "
+            "an AI assistant for a Scottish charitable organisation (Community Development "
+            "Company Nesting, South Nesting, Shetland).\n\n"
+            "Review these exchanges where the agent answered well (no user corrections "
+            "followed). Extract reusable patterns — approaches that should be repeated "
+            "in future similar situations.\n\n"
+            "For each pattern, identify:\n"
+            "- TRIGGER: What kind of question or request triggers this pattern\n"
+            "- APPROACH: What the agent did well (specific, actionable)\n"
+            "- CATEGORY: One of: document_drafting, information_retrieval, "
+            "meeting_support, funding, community_engagement, technical, general\n\n"
+            "Output 1–5 patterns. Format EXACTLY as:\n\n"
+            "PATTERN 1\n"
+            "Trigger: [when user asks...]\n"
+            "Approach: [the agent should...]\n"
+            "Category: [category]\n\n"
+            "PATTERN 2\n...\n\n"
+            "If no clear reusable patterns emerge, respond only with: "
+            "'No patterns identified.'\n\n"
+            f"Exchanges:\n\n{combined}"
+        )
+
+        try:
+            response = await self._dream_call(prompt)
+        except Exception as exc:
+            return _TaskOutcome(
+                task="learn_from_interactions",
+                success=False,
+                summary="",
+                error=f"LLM call failed: {exc}",
+            )
+
+        if "no patterns identified" in response.lower():
+            return _TaskOutcome(
+                task="learn_from_interactions",
+                success=True,
+                summary="LLM found no reusable patterns in today's exchanges.",
+            )
+
+        # Parse patterns
+        patterns = self._parse_learned_patterns(response)
+        skills_stored = 0
+
+        for trigger, approach, category in patterns:
+            try:
+                await log_learned_skill(
+                    skill_name=category,
+                    trigger_pattern=trigger,
+                    description=approach,
+                    source=f"dream_learn_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
+                )
+                skills_stored += 1
+            except Exception as exc:
+                log.warning("log_learned_skill failed: %s", exc)
+
+        return _TaskOutcome(
+            task="learn_from_interactions",
+            success=True,
+            summary=(
+                f"Analysed {len(good_exchanges)} successful exchange(s). "
+                f"Extracted {len(patterns)} pattern(s), stored {skills_stored}."
+            ),
+        )
+
+    def _parse_learned_patterns(self, text: str) -> list[tuple[str, str, str]]:
+        """Parse PATTERN N / Trigger: / Approach: / Category: blocks."""
+        results: list[tuple[str, str, str]] = []
+        blocks = re.split(r"PATTERN\s+\d+", text, flags=re.IGNORECASE)
+        for block in blocks[1:]:
+            t = re.search(r"Trigger:\s*(.+?)(?:\n|$)", block, re.IGNORECASE)
+            a = re.search(r"Approach:\s*(.+?)(?:\n|$)", block, re.IGNORECASE)
+            c = re.search(r"Category:\s*(.+?)(?:\n|$)", block, re.IGNORECASE)
+            if t and a:
+                results.append((
+                    t.group(1).strip(),
+                    a.group(1).strip(),
+                    c.group(1).strip() if c else "general",
+                ))
+        return results[:5]
+
+    # ── Task 4: map_document_relationships ────────────────────────────────────
+
+    async def map_document_relationships(self) -> _TaskOutcome:
+        """
+        Sample chunks from pairs of document types and ask the LLM to identify
+        connections: shared projects, referenced decisions, linked funding.
+        Appends findings to skills_config/memory/knowledge_graph.md.
+        Capped at 20 pair comparisons per cycle.
+        """
+        # get_all_document_metadata returns one dict per chunk (async).
+        # Fall back to list_documents (sync) if the method is unavailable.
+        if callable(getattr(self._vs, "get_all_document_metadata", None)):
+            try:
+                documents = await self._vs.get_all_document_metadata()
+            except TypeError:
+                documents = self._vs.get_all_document_metadata()
+        else:
+            documents = self._vs.list_documents()
+        if not documents:
+            return _TaskOutcome(
+                task="map_document_relationships",
+                success=True,
+                summary="No documents in store — skipping.",
+            )
+
+        by_type: dict[str, list[dict]] = {}
+        for doc in documents:
+            dtype = doc.get("document_type", "other")
+            by_type.setdefault(dtype, []).append(doc)
+
+        eligible = [dt for dt, docs in by_type.items() if len(docs) >= 2]
+        if len(eligible) < 2:
+            return _TaskOutcome(
+                task="map_document_relationships",
+                success=True,
+                summary=(
+                    f"Only {len(eligible)} eligible document type(s) — "
+                    f"need at least 2 to compare."
+                ),
+            )
+
+        pairs = [
+            (eligible[i], eligible[j])
+            for i in range(len(eligible))
+            for j in range(i + 1, len(eligible))
+        ]
+        if len(pairs) > 20:
+            pairs = random.sample(pairs, 20)
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        findings: list[str] = []
+
+        for type_a, type_b in pairs:
+            chunks_a = self._sample_chunks_for_type(type_a, n=3)
+            chunks_b = self._sample_chunks_for_type(type_b, n=3)
+            if not chunks_a or not chunks_b:
+                continue
+
+            context_a = "\n---\n".join(f"[{type_a}] {c}" for c in chunks_a)
+            context_b = "\n---\n".join(f"[{type_b}] {c}" for c in chunks_b)
+
+            prompt = (
+                "You are analysing documents held by CDCN (Community Development Company "
+                "Nesting), a Scottish charitable organisation in South Nesting, Shetland.\n\n"
+                f"Review sample chunks from two document types and identify any connections: "
+                f"shared projects, referenced decisions, linked funding, or common themes.\n\n"
+                f"DOCUMENT TYPE A — {type_a.upper()}:\n{_truncate(context_a, 1500)}\n\n"
+                f"DOCUMENT TYPE B — {type_b.upper()}:\n{_truncate(context_b, 1500)}\n\n"
+                "List connections as bullet points (max 5). "
+                "If no meaningful connections are apparent, respond only with "
+                "'No connections identified.'"
+            )
+
+            try:
+                response = await self._dream_call(prompt)
+                if "no connections identified" not in response.lower():
+                    findings.append(
+                        f"### {type_a.capitalize()} ↔ {type_b.capitalize()}\n\n"
+                        f"{response.strip()}"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "map_document_relationships LLM failed (%s / %s): %s",
+                    type_a, type_b, exc,
+                )
+
+        if findings:
+            async with _get_file_lock(_KNOWLEDGE_GRAPH_FILE):
+                _KNOWLEDGE_GRAPH_FILE.parent.mkdir(parents=True, exist_ok=True)
+                existing = _read_optional(_KNOWLEDGE_GRAPH_FILE) or "# CDCN Knowledge Graph\n"
+                new_section = (
+                    f"\n## Document Relationships — {today}\n\n"
+                    + "\n\n".join(findings)
+                    + "\n"
+                )
+                _KNOWLEDGE_GRAPH_FILE.write_text(existing.rstrip() + new_section)
+
+        return _TaskOutcome(
+            task="map_document_relationships",
+            success=True,
+            summary=(
+                f"Compared {len(pairs)} pair(s) across "
+                f"{len(eligible)} document type(s). "
+                f"Found {len(findings)} relationship(s)."
+            ),
+        )
+
+    def _sample_chunks_for_type(self, doc_type: str, n: int = 3) -> list[str]:
+        """Return up to n random chunk texts for the given document_type."""
+        try:
+            col = self._vs._get_collection()
+            results = col.get(
+                where={"document_type": doc_type},
+                include=["documents"],
+            )
+            docs: list[str] = results.get("documents") or []
+            if not docs:
+                return []
+            return [d[:600] for d in random.sample(docs, min(n, len(docs)))]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("_sample_chunks_for_type(%s) failed: %s", doc_type, exc)
+            return []
+
+    # ── Task 4: anticipate_tomorrow ───────────────────────────────────────────
+
+    async def anticipate_tomorrow(self) -> _TaskOutcome:
+        """
+        Predict tomorrow's 5 most likely questions, run vector searches for
+        each, and write a pre-loaded prefetch cache with an expiry timestamp.
+        The router checks prefetch_cache.md before ChromaDB on each query.
+        """
+        funding_text = _read_optional(Path("skills_config/funding_deadlines.yaml"))
+        sessions_text = self._read_sessions_n_days(7)
+        graph_text = _read_optional(_KNOWLEDGE_GRAPH_FILE)
+        memory_text = self._memory.load_memory()
+
+        context = (
+            f"## Upcoming Funding Deadlines\n"
+            f"{funding_text or '(none recorded)'}\n\n"
+            f"## Recent Activity (last 7 days)\n"
+            f"{_truncate(sessions_text, 3000)}\n\n"
+            f"## Knowledge Graph\n"
+            f"{_truncate(graph_text, 1500)}\n\n"
+            f"## Long-term Memory\n"
+            f"{_truncate(memory_text, 1500)}"
+        )
+
+        prompt = (
+            "You are the overnight planning assistant for CDCN Agent, serving a Scottish "
+            "charitable organisation (Community Development Company Nesting, South Nesting, "
+            "Shetland).\n\n"
+            "Based on CDCN's recent activity and upcoming deadlines, predict the 5 most "
+            "likely questions or tasks for tomorrow. For each, give a concise document "
+            "search query.\n\n"
+            "Format EXACTLY as:\n\n"
+            "PREDICTION 1\n"
+            "Question: [the likely question or task in one sentence]\n"
+            "Search: [a short specific search query for relevant documents]\n\n"
+            "PREDICTION 2\n...\n\n"
+            f"Context:\n{context}"
+        )
+
+        try:
+            response = await self._dream_call(prompt)
+        except Exception as exc:  # noqa: BLE001
+            return _TaskOutcome(
+                task="anticipate_tomorrow",
+                success=False,
+                summary="",
+                error=f"LLM call failed: {exc}",
+            )
+
+        predictions = self._parse_predictions(response)
+        if not predictions:
+            # Fallback: pre-warm cache with a generic most-likely query
+            _fallback_queries = [
+                ("Latest board meeting decisions", "board meeting minutes decisions"),
+                ("Upcoming funding deadlines", "funding deadlines grant application"),
+            ]
+            try:
+                for question, search_query in _fallback_queries:
+                    await self._vs.search(search_query, n_results=4)
+            except Exception:
+                pass
+            return _TaskOutcome(
+                task="anticipate_tomorrow",
+                success=True,
+                summary="LLM returned no parseable predictions — ran fallback prefetch searches.",
+            )
+
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        cache_parts = [
+            f"# Prefetch Cache",
+            f"",
+            f"Generated: {now_str}",
+            f"Expires: {tomorrow}",
+            f"",
+        ]
+
+        chunks_loaded = 0
+        for i, (question, search_query) in enumerate(predictions, start=1):
+            cache_parts.append(f"## Prediction {i}: {question}")
+            cache_parts.append(f"*Search: {search_query}*")
+            cache_parts.append("")
+            try:
+                hits = await self._vs.search(search_query, n_results=4)
+                if hits:
+                    for hit in hits:
+                        fname = Path(hit.get("source_file", "unknown")).name
+                        page = hit.get("page_number", 0)
+                        excerpt = hit.get("text", "")[:400]
+                        cache_parts.append(
+                            f"**From {fname} (page {page or '?'}):**\n{excerpt}"
+                        )
+                        cache_parts.append("")
+                        chunks_loaded += 1
+                else:
+                    cache_parts.append("*(no relevant documents found)*")
+                    cache_parts.append("")
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "anticipate_tomorrow search failed for '%s': %s", search_query, exc
+                )
+                cache_parts.append(f"*(search failed)*")
+                cache_parts.append("")
+
+        prefetch_path = Path(settings.memory_path) / "prefetch_cache.md"
+        async with _get_file_lock(prefetch_path):
+            prefetch_path.parent.mkdir(parents=True, exist_ok=True)
+            prefetch_path.write_text("\n".join(cache_parts))
+
+        return _TaskOutcome(
+            task="anticipate_tomorrow",
+            success=True,
+            summary=(
+                f"Generated {len(predictions)} prediction(s), "
+                f"pre-loaded {chunks_loaded} chunk(s). "
+                f"Cache expires {tomorrow}."
+            ),
+        )
+
+    def _parse_predictions(self, text: str) -> list[tuple[str, str]]:
+        """Parse PREDICTION N / Question: / Search: blocks from LLM output."""
+        results: list[tuple[str, str]] = []
+        blocks = re.split(r"PREDICTION\s+\d+", text, flags=re.IGNORECASE)
+        for block in blocks[1:]:
+            q = re.search(r"Question:\s*(.+?)(?:\n|$)", block, re.IGNORECASE)
+            s = re.search(r"Search:\s*(.+?)(?:\n|$)", block, re.IGNORECASE)
+            if q and s:
+                results.append((q.group(1).strip(), s.group(1).strip()))
+        return results[:5]
+
+    # ── Task 5: refine_style_guide ────────────────────────────────────────────
+
+    async def refine_style_guide(self) -> _TaskOutcome:
+        """
+        Find writer skill invocations across the last 7 days.
+        If the same document type was drafted more than once, compare
+        the approaches and propose additions to style_guide.md.
+        All proposals go to pending_changes/ — nothing is auto-applied.
+        Skipped if fewer than 3 writer invocations today.
+        """
+        today_invocations = self._find_writer_invocations(days=1)
+
+        if len(today_invocations) < 3:
+            return _TaskOutcome(
+                task="refine_style_guide",
+                success=True,
+                summary=(
+                    f"Only {len(today_invocations)} writer invocation(s) today "
+                    f"(threshold: 3) — skipping."
+                ),
+            )
+
+        # Look across the whole week for repeat drafts of the same type
+        weekly_invocations = self._find_writer_invocations(days=7)
+        by_type: dict[str, list[str]] = {}
+        for dtype, draft_text in weekly_invocations:
+            by_type.setdefault(dtype, []).append(draft_text)
+
+        repeated = {dt: drafts for dt, drafts in by_type.items() if len(drafts) > 1}
+        if not repeated:
+            return _TaskOutcome(
+                task="refine_style_guide",
+                success=True,
+                summary="No document type drafted more than once this week — nothing to compare.",
+            )
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        pending_dir = Path(settings.pending_changes_path)
+        pending_dir.mkdir(parents=True, exist_ok=True)
+        proposals_written = 0
+
+        for dtype, drafts in repeated.items():
+            prompt = (
+                "You are reviewing two drafts of the same document type produced by "
+                "CDCN Agent for a Scottish charitable organisation.\n\n"
+                f"Document type: {dtype}\n\n"
+                f"DRAFT A:\n{_truncate(drafts[0], 1500)}\n\n"
+                f"DRAFT B:\n{_truncate(drafts[-1], 1500)}\n\n"
+                "Compare these drafts and identify:\n"
+                "1. What worked better (specific, actionable observations)\n"
+                "2. Structural or phrasing choices that produced clearer output\n"
+                "3. Proposed additions to the writing style guide (maximum 3 bullets)\n\n"
+                "Format your response as:\n\n"
+                "OBSERVATIONS:\n[2–3 sentences]\n\n"
+                "PROPOSED STYLE GUIDE ADDITIONS:\n"
+                "- [addition 1]\n"
+                "- [addition 2]\n"
+                "- [addition 3 if needed]"
+            )
+
+            try:
+                response = await self._dream_call(prompt)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("refine_style_guide LLM call failed for %s: %s", dtype, exc)
+                continue
+
+            proposal_path = pending_dir / f"style_{today}.md"
+            block = (
+                f"# Proposed Style Guide Addition\n\n"
+                f"Generated: {today}\nDocument type: {dtype}\nStatus: pending\n\n"
+                f"## Comparative Analysis\n\n{response.strip()}\n\n"
+                f"---\n"
+                f"*Generated by DreamWorkerSkill refine_style_guide. "
+                f"Requires human review.*\n"
+            )
+            try:
+                # Append if file exists (multiple types in one cycle)
+                if proposal_path.exists():
+                    proposal_path.write_text(proposal_path.read_text() + f"\n\n{block}")
+                else:
+                    proposal_path.write_text(block)
+                self._pending.propose(
+                    title=f"style_guide.md addition — {dtype} — {today}",
+                    diff=response.strip(),
+                    author="dream_worker",
+                )
+                proposals_written += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("refine_style_guide write failed: %s", exc)
+
+        return _TaskOutcome(
+            task="refine_style_guide",
+            success=True,
+            summary=(
+                f"Compared {len(repeated)} document type(s) drafted multiple times. "
+                f"Wrote {proposals_written} proposal(s) to pending_changes/."
+            ),
+        )
+
+    # ── Session reading helpers ───────────────────────────────────────────────
+
+    def _read_sessions_n_days(self, n_days: int) -> str:
+        """
+        Read all session transcripts from the last n_days into a single string.
+        Mirrors OpenCLAW's session-file reading pattern from memory/session-files.ts.
+        """
+        from app.gateway.session import Session  # lazy — avoids circular import
+
+        session_root = Path(settings.memory_path) / "session_log"
+        parts: list[str] = []
+
+        for offset in range(n_days):
+            date_str = (datetime.now(timezone.utc) - timedelta(days=offset)).strftime("%Y-%m-%d")
+            day_dir = session_root / date_str
+            if not day_dir.exists():
+                continue
+            for session_file in sorted(day_dir.glob("*.json")):
+                if session_file.suffix == ".tmp":
+                    continue
+                try:
+                    data = json.loads(session_file.read_text())
+                    session = Session(**data)
+                    t = _session_transcript(session)
+                    if t.strip():
+                        parts.append(
+                            f"[{date_str} / {session.session_id[:8]}]\n{t}"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("Skipping session file %s: %s", session_file, exc)
+
+        return "\n\n---\n\n".join(parts) if parts else "(no sessions found)"
+
+    def _find_writer_invocations(self, days: int) -> list[tuple[str, str]]:
+        """
+        Scan session logs from the last `days` days for assistant turns that
+        look like formal document drafts from the writer skill.
+
+        Returns list of (document_type, draft_text) tuples.
+        Document type is inferred from structural markers in the text.
+        """
+        from app.gateway.session import Session  # lazy import
+
+        _DOC_PATTERNS = [
+            (r"# Funding Application", "application"),
+            (r"# Minutes of a Meeting", "minutes"),
+            (r"\|\s*\*\*Policy Number\*\*", "policy"),
+            (r"#[^\n]+Policy\b", "policy"),
+            (r"# Constitution", "constitution"),
+            (r"\bAnnual Report\b", "report"),
+        ]
+
+        session_root = Path(settings.memory_path) / "session_log"
+        invocations: list[tuple[str, str]] = []
+
+        for offset in range(days):
+            date_str = (datetime.now(timezone.utc) - timedelta(days=offset)).strftime("%Y-%m-%d")
+            day_dir = session_root / date_str
+            if not day_dir.exists():
+                continue
+            for session_file in sorted(day_dir.glob("*.json")):
+                if session_file.suffix == ".tmp":
+                    continue
+                try:
+                    data = json.loads(session_file.read_text())
+                    session = Session(**data)
+                    for msg in session.messages:
+                        if msg.get("role") != "assistant":
+                            continue
+                        content = msg.get("content", "")
+                        for pattern, dtype in _DOC_PATTERNS:
+                            if re.search(pattern, content, re.IGNORECASE):
+                                invocations.append((dtype, content))
+                                break
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("Skipping session file %s: %s", session_file, exc)
+
+        return invocations
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    async def _dream_call(self, prompt: str) -> str:
+        """
+        Route an LLM call through the module-level dream_chat() function.
+
+        Always targets the Pi 5 dream endpoint regardless of the agent's current
+        state.  The module-level name allows tests to patch
+        ``app.skills.dream_worker.dream_chat`` for isolation.
+        """
+        return await dream_chat([{"role": "user", "content": prompt}])
+
+    async def _audit_event(self, action: str, detail: str) -> None:
+        try:
+            await self._audit.log_event(
+                actor="dream_worker",
+                action=action,
+                detail=detail,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("dream_worker audit log failed (%s): %s", action, exc)
+
+    def _build_cycle_summary(
+        self,
+        outcomes: list[_TaskOutcome],
+        start_ts: str,
+        duration_ms: int,
+    ) -> str:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        lines = [
+            f"# Dream Cycle — {today}",
+            "",
+            f"Started: {start_ts}",
+            f"Total duration: {duration_ms / 1000:.1f}s",
+            "",
+            "## Task Outcomes",
+            "",
+        ]
+        for o in outcomes:
+            icon = "✓" if o.success else "✗"
+            lines.append(f"### {icon} {o.task} ({o.duration_ms}ms)")
+            if o.summary:
+                lines.append(o.summary)
+            if o.error:
+                lines.append(f"Error: {o.error}")
+            lines.append("")
+        return "\n".join(lines)
+
+    # ── Backward-compat stubs ─────────────────────────────────────────────────
+    # Called by old state_manager code via run(task="prefetch/summarize_pending")
+
+    async def _prefetch_compat(self) -> SkillResult:
+        outcome = await self.anticipate_tomorrow()
+        return SkillResult(
+            success=outcome.success,
+            output=outcome.summary,
+            error=outcome.error,
+        )
+
+    async def _summarize_pending_compat(self) -> SkillResult:  # noqa: D401
+        pending_dir = Path(settings.pending_changes_path)
+        files = list(pending_dir.glob("*.md")) if pending_dir.exists() else []
+        if not files:
+            return SkillResult(success=True, output="No pending changes.")
+        combined = _truncate(
+            "\n\n".join(f.read_text() for f in files[:10]),
+            max_chars=4000,
+        )
+        try:
+            summary = await self._dream_call(
+                "Summarise the following pending changes concisely:\n\n" + combined
+            )
+        except Exception as exc:  # noqa: BLE001
+            return SkillResult(success=False, error=str(exc))
+        return SkillResult(success=True, output=summary)
+
+
+# Backward-compat alias
+DreamWorker = DreamWorkerSkill

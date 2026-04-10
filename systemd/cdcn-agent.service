@@ -1,0 +1,48 @@
+[Unit]
+Description=CDCN Agent — community document AI assistant
+Documentation=file:///opt/cdcn-agent/docs/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cdcn-agent
+Group=cdcn-agent
+WorkingDirectory=/opt/cdcn-agent
+EnvironmentFile=/etc/cdcn-agent/.env
+
+ExecStart=/opt/cdcn-agent/.venv/bin/uvicorn app.main:app \
+    --host ${GATEWAY_BIND_HOST:-127.0.0.1} \
+    --port ${GATEWAY_PORT:-8400} \
+    --log-level info \
+    --access-log
+
+Restart=on-failure
+RestartSec=15
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cdcn-agent
+
+# Systemd hardening
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+
+# Allow writes only to the data and log directories
+ReadWritePaths=/var/lib/cdcn-agent
+ReadWritePaths=/var/log/cdcn-agent
+ReadWritePaths=/opt/cdcn-agent/skills_config
+
+[Install]
+WantedBy=multi-user.target

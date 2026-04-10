@@ -1,0 +1,545 @@
+"""
+AgentRouter — agentic loop (skill detection, execution, memory consolidation).
+gateway_router — FastAPI APIRouter exposed to main.py (/api prefix).
+
+The two concerns live in one file so the FastAPI /chat endpoint can share the
+AgentRouter singleton without a circular import.
+
+Agentic loop (per OpenCLAW pattern, adapted for Python / Ollama):
+  1. Prompt-injection guard
+  2. Load or create session
+  3. Get system prompt (60 s TTL cache from memory_skill)
+  4. Prefetch cache lookup for quick context
+  5. Append user message to history
+  6. First LLM call (non-streaming — need full text to detect skill call)
+  7. If response contains a fenced JSON skill call: execute skill, re-prompt
+  8. Stream final response to caller
+  9. Persist session; at every 10th exchange trigger async memory consolidation
+"""
+import asyncio
+import json
+import logging
+import re
+import time
+from collections.abc import AsyncGenerator
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from app.auth.auth import User, check_rate_limit, get_current_user
+from app.config import settings
+from app.gateway.session import Session, SessionManager
+from app.llm_client import CDCNLLMClient, CDCNLLMError, llm_client
+from app.skills.base import BaseSkill
+from app.storage.audit_log import log_event
+from app.state_manager import state
+
+log = logging.getLogger(__name__)
+
+# ── Prompt injection detection ────────────────────────────────────────────────
+# Patterns are compiled once at import time.  Checked before any LLM call.
+
+_INJECTION_PATTERNS: list[re.Pattern] = [
+    re.compile(r"ignore\s+previous\s+instructions", re.IGNORECASE),
+    re.compile(r"(?<!\w)system\s*:", re.IGNORECASE),
+    re.compile(r"^###", re.MULTILINE),
+]
+
+# ── Skill-call extraction ─────────────────────────────────────────────────────
+# Matches a JSON object containing "skill" inside a fenced code block.
+# The LLM is instructed to use exactly this format.
+
+_SKILL_CALL_RE = re.compile(
+    r"```(?:json)?\s*(\{[^`]*\"skill\"[^`]*\})\s*```",
+    re.DOTALL,
+)
+
+# ── System-prompt cache ───────────────────────────────────────────────────────
+# Keyed by role string.  Value is (prompt_text, monotonic_timestamp).
+
+_PROMPT_CACHE: dict[str, tuple[str, float]] = {}
+_PROMPT_CACHE_TTL = 60.0  # seconds
+
+
+# ── AgentRouter ───────────────────────────────────────────────────────────────
+
+
+class AgentRouter:
+    """
+    Orchestrates the full agentic turn: guard → session → prompt → LLM → skill
+    → final response → persist → optional consolidation.
+
+    Intended to be instantiated once (module-level singleton via _get_router()).
+    """
+
+    def __init__(
+        self,
+        skills: dict[str, BaseSkill],
+        llm: CDCNLLMClient,
+        memory_skill,
+    ) -> None:
+        self.skills = skills
+        self.llm = llm
+        self.memory_skill = memory_skill
+        self._sessions = SessionManager()
+
+    # ── Public entry point ────────────────────────────────────────────────────
+
+    async def handle_message(
+        self,
+        user_id: str,
+        role: str,
+        message: str,
+        channel_id: str = "",
+    ) -> AsyncGenerator[str, None]:
+        """
+        Full agentic turn.  Yields text tokens suitable for StreamingResponse.
+
+        Never raises — errors are yielded as human-readable messages so the
+        caller always receives a complete response.
+        """
+        log.info("handle_message called: user=%s message=%s", user_id, message[:50])
+        # ── 0. Rate limit ─────────────────────────────────────────────────────
+        if not check_rate_limit(user_id):
+            yield "Request rate limit reached (20 per minute). Please wait a moment."
+            return
+
+        # ── 1. Prompt injection guard ─────────────────────────────────────────
+        if self._is_injection(message):
+            await log_event(
+                actor=user_id,
+                action="injection_rejected",
+                target=channel_id,
+                detail=message[:300],
+            )
+            yield (
+                "I'm sorry, I can't process that request. "
+                "Please rephrase and try again."
+            )
+            return
+
+        # ── 2. Session ────────────────────────────────────────────────────────
+        session = self._sessions.load_or_create(user_id, role)
+
+        # ── 3. System prompt (60 s TTL cache) ────────────────────────────────
+        system_prompt = await self._get_system_prompt(role)
+
+        log.info("System prompt loaded, making LLM call")
+        # ── 4. Prefetch cache ─────────────────────────────────────────────────
+        prefetch_ctx = self._check_prefetch(message)
+
+        # ── 5. Append user message ────────────────────────────────────────────
+        user_content = message
+        if prefetch_ctx:
+            user_content = (
+                f"{message}\n\n"
+                f"[Relevant pre-loaded context]\n{prefetch_ctx}"
+            )
+        session.messages.append({"role": "user", "content": user_content})
+        # RAG injection — only for explicit document queries
+        _doc_keywords = ["minute", "minutes", "meeting", "attended", "present", "apolog", "who was", "who attended", "10/02", "18/02", "04/02", "10/2", "18/2", "4/2",
+                         "decision", "agreed", "action point", "funding application",
+                         "according to", "what does the", "what did the"]
+        _needs_rag = any(k in message.lower() for k in _doc_keywords)
+        if _needs_rag:
+            try:
+                from app.skills.search import SearchSkill
+                _s = SearchSkill()
+                _r = await _s.run({"query": message, "n_results": 8})
+                if _r.success and _r.output:
+                    ctx = "IMPORTANT: Read ALL of the following archive results carefully before answering. The answer IS in these results:\n\n" + _r.output[:4000]
+                    session.messages.append({"role": "user", "content": ctx})
+                    log.info("RAG injected for document query")
+            except Exception as e:
+                log.warning("RAG failed: %s", e)
+
+        # ── 6–8. LLM → optional skill → final response ────────────────────────
+        response_text = ""
+        skill_used = ""
+
+        try:
+            # First call: non-streaming so we can inspect the full text for a
+            # skill call JSON before deciding whether to re-prompt.
+            first_response = await self.llm.chat(
+                session.messages,
+                system_prompt=system_prompt,
+            )
+
+            # ── 7. Skill call detection ───────────────────────────────────────
+            log.info("LLM first response: %s", first_response[:500])
+            skill_call = self._parse_skill_call(first_response)
+
+            if skill_call:
+                skill_name = skill_call.get("skill", "")
+                skill_args = skill_call.get("args", {})
+                skill_used = skill_name
+
+                skill_result = await self._execute_skill(skill_name, skill_args)
+
+                # Feed skill result back as a user turn then stream the reply
+                session.messages.append(
+                    {"role": "assistant", "content": first_response}
+                )
+                session.messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"[Result of skill '{skill_name}']\n"
+                            f"{json.dumps(skill_result, indent=2, default=str)}"
+                        ),
+                    }
+                )
+
+                # ── 8. Stream final response ──────────────────────────────────
+                async for token in self.llm.chat_stream(
+                    session.messages,
+                    system_prompt=system_prompt,
+                    skill_used=skill_used,
+                ):
+                    response_text += token
+                    yield token
+
+            else:
+                # No skill call — yield the already-fetched response directly.
+                # Emitted as a single chunk; callers treating this as a stream
+                # still receive a complete response.
+                response_text = first_response
+                yield first_response
+
+        except CDCNLLMError as exc:
+            log.error("LLM error in handle_message for user=%s: %s", user_id, exc)
+            error_msg = (
+                "I encountered an error reaching the language model. "
+                "Please try again in a moment."
+            )
+            yield error_msg
+            response_text = f"[LLM ERROR: {exc}]"
+
+        # ── 9. Persist session ─────────────────────────────────────────────────
+        if response_text:
+            session.messages.append(
+                {"role": "assistant", "content": response_text}
+            )
+        session.exchange_count += 1
+        self._sessions.save(session)
+
+        # ── Memory consolidation every 10 exchanges ───────────────────────────
+        if session.exchange_count > 0 and session.exchange_count % 10 == 0:
+            asyncio.create_task(
+                self._consolidate_memory(session),
+                name=f"consolidate-{session.session_id}-{session.exchange_count}",
+            )
+
+    # ── Injection detection ───────────────────────────────────────────────────
+
+    def _is_injection(self, message: str) -> bool:
+        return any(p.search(message) for p in _INJECTION_PATTERNS)
+
+    # ── System prompt (cached) ────────────────────────────────────────────────
+
+    async def _get_system_prompt(self, role: str) -> str:
+        """
+        Return a system prompt for the given role.
+
+        The prompt is assembled from:
+          - memory_skill.get_system_prompt() — soul, style guide, agent context
+          - _build_skills_block()             — skill listing in canonical format
+
+        Result is cached for _PROMPT_CACHE_TTL seconds per role to avoid
+        repeated file reads on every turn.
+        """
+        now = time.monotonic()
+        cached = _PROMPT_CACHE.get(role)
+        if cached and (now - cached[1]) < _PROMPT_CACHE_TTL:
+            return cached[0]
+
+        soul_prompt = self.memory_skill.get_system_prompt()
+        skills_block = self._build_skills_block()
+        prompt = f"{soul_prompt}\n\n{skills_block}"
+
+        _PROMPT_CACHE[role] = (prompt, now)
+        return prompt
+
+    def _build_skills_block(self) -> str:
+        """
+        Build the skills listing injected into every system prompt.
+
+        Format mirrors the OpenCLAW <available_skills> section — each entry
+        has a USE WHEN line and a canonical CALL FORMAT so the LLM knows
+        exactly how to invoke it.
+        """
+        lines = [
+            "## Available Skills",
+            "",
+            "Scan this list before every reply.",
+            "If exactly one skill clearly applies, call it using the JSON format below.",
+            "If none apply, reply directly without a skill call.",
+            "Never call more than one skill per turn.",
+            "",
+        ]
+        for name, skill in self.skills.items():
+            lines.extend(
+                [
+                    f"SKILL: {name}",
+                    f"USE WHEN: {skill.description}",
+                    f'CALL FORMAT: {{"skill":"{name}","args":{{...}}}}',
+                    "",
+                ]
+            )
+        lines += [
+            "To invoke a skill, include ONLY the following in your response, "
+            "inside a fenced code block:",
+            "```json",
+            '{"skill": "<skill_name>", "args": {"key": "value", ...}}',
+            "```",
+            "Do not include any other text inside the fenced block.",
+        ]
+        return "\n".join(lines)
+
+    # ── Prefetch cache ────────────────────────────────────────────────────────
+
+    def _check_prefetch(self, message: str) -> str:
+        """
+        Scan prefetch_cache.md for sections whose keywords overlap with the
+        incoming message.  Returns the first matching section (up to 600 chars)
+        or empty string if nothing is relevant.
+        """
+        cache_path = Path(settings.memory_path) / "prefetch_cache.md"
+        if not cache_path.exists():
+            return ""
+        try:
+            content = cache_path.read_text()
+        except OSError:
+            return ""
+
+        # Meaningful words only (skip short stop-words)
+        query_words = {w.lower() for w in message.split() if len(w) > 4}
+        if not query_words:
+            return ""
+
+        for section in content.split("## Q:"):
+            section_lower = section.lower()
+            if any(w in section_lower for w in query_words):
+                return section.strip()[:600]
+
+        return ""
+
+    # ── Skill execution ───────────────────────────────────────────────────────
+
+    def _parse_skill_call(self, text: str) -> dict | None:
+        """
+        Extract the first skill-call JSON object from a fenced code block.
+
+        Returns None if no valid skill call is found.
+        """
+        match = _SKILL_CALL_RE.search(text)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(1))
+            if isinstance(data, dict) and "skill" in data:
+                return data
+        except json.JSONDecodeError as exc:
+            log.debug("Skill JSON parse failed: %s — raw: %s", exc, match.group(1)[:200])
+        return None
+
+    async def _execute_skill(self, skill_name: str, args: dict) -> dict:
+        """
+        Dispatch to the named skill.  Always returns a dict — never raises.
+        Unknown / failed skills return an error dict the LLM can explain.
+        """
+        skill = self.skills.get(skill_name)
+        if not skill:
+            log.warning("LLM requested unknown skill: %s", skill_name)
+            return {
+                "success": False,
+                "error": f"Skill '{skill_name}' is not available.",
+                "output": None,
+            }
+        try:
+            result = await skill.run(**args)
+            return {
+                "success": result.success,
+                "output": result.output,
+                "error": result.error,
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Skill '%s' raised an exception", skill_name)
+            return {"success": False, "error": str(exc), "output": None}
+
+    # ── Memory consolidation ──────────────────────────────────────────────────
+
+    async def _consolidate_memory(self, session: Session) -> None:
+        """
+        Ask the LLM to summarise the last 20 messages into key facts and
+        action items, then store them via memory_skill.
+
+        Runs as a background Task — failures are logged, never propagated.
+        """
+        log.info(
+            "Memory consolidation triggered: session=%s exchange=%d",
+            session.session_id,
+            session.exchange_count,
+        )
+        try:
+            recent = session.messages[-20:]
+            transcript = "\n".join(
+                f"{m['role'].upper()}: {str(m.get('content', ''))[:400]}"
+                for m in recent
+            )
+            summary_messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        "Summarise the following conversation into a concise bullet-point "
+                        "list of key facts, decisions, and action items for future reference:\n\n"
+                        f"{transcript}"
+                    ),
+                }
+            ]
+            summary = await self.llm.chat(
+                summary_messages,
+                system_prompt=(
+                    "You are a helpful assistant summarising a conversation "
+                    "for long-term memory storage. Be concise and factual."
+                ),
+            )
+            await self.memory_skill.run(
+                action="store_summary",
+                summary=summary,
+                session_id=session.session_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("Memory consolidation failed for session %s: %s", session.session_id, exc)
+
+
+# ── Singleton factory ─────────────────────────────────────────────────────────
+
+_router_instance: AgentRouter | None = None
+
+
+def set_router_instance(router: AgentRouter) -> None:
+    """
+    Register the fully-constructed AgentRouter singleton.
+    Called once from main.py after all dependencies are wired.
+    """
+    global _router_instance
+    _router_instance = router
+
+
+def _get_agent_router() -> AgentRouter:
+    """
+    Return the pre-registered singleton.  Falls back to building a minimal
+    router (without DreamWorkerSkill) if called before main.py has run —
+    this only happens during unit tests or early startup edge cases.
+    """
+    global _router_instance
+    if _router_instance is not None:
+        return _router_instance
+
+    from app.skills.indexer import IndexerSkill
+    from app.skills.memory import MemorySkill
+    from app.skills.search import SearchSkill
+    from app.skills.writer import WriterSkill
+    from app.skills.skill_builder import SkillBuilderSkill
+
+    memory_skill = MemorySkill()
+    skills: dict[str, BaseSkill] = {
+        "search": SearchSkill(),
+        "indexer": IndexerSkill(),
+        "writer": WriterSkill(),
+        "skill_builder": SkillBuilderSkill(),
+        "memory": memory_skill,
+    }
+    _router_instance = AgentRouter(
+        skills=skills,
+        llm=llm_client,
+        memory_skill=memory_skill,
+    )
+    return _router_instance
+
+
+# ── FastAPI router ────────────────────────────────────────────────────────────
+# gateway_router is imported by main.py and mounted at /api.
+
+gateway_router = APIRouter()
+
+
+# ── /chat ─────────────────────────────────────────────────────────────────────
+
+
+class ChatRequest(BaseModel):
+    message: str
+    user_id: str = ""
+    role: str = "user"
+    channel_id: str = ""
+
+
+@gateway_router.post("/chat", tags=["agent"])
+async def chat_endpoint(
+    body: ChatRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Stream a response from the agent.
+
+    Internally runs the full agentic loop:
+    injection guard → session → skill detection → LLM → persist.
+    """
+    agent = _get_agent_router()
+    uid = body.user_id or current_user.username
+
+    async def _stream():
+        async for token in agent.handle_message(
+            user_id=uid,
+            role=body.role,
+            message=body.message,
+            channel_id=body.channel_id,
+        ):
+            yield token
+
+    return StreamingResponse(_stream(), media_type="text/plain; charset=utf-8")
+
+
+# ── /status ───────────────────────────────────────────────────────────────────
+
+
+@gateway_router.get("/status", tags=["gateway"])
+async def gateway_status():
+    return state.status()
+
+
+# ── Session HTTP endpoints ────────────────────────────────────────────────────
+
+
+@gateway_router.get("/sessions", tags=["sessions"])
+async def list_sessions(current_user: User = Depends(get_current_user)):
+    """List today's sessions."""
+    manager = SessionManager()
+    sessions = manager.get_today_sessions()
+    return [
+        {
+            "session_id": s.session_id,
+            "user_id": s.user_id,
+            "role": s.role,
+            "exchange_count": s.exchange_count,
+            "created_at": s.created_at,
+            "last_active": s.last_active,
+        }
+        for s in sessions
+    ]
+
+
+@gateway_router.get("/sessions/{session_id}", tags=["sessions"])
+async def get_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Return one session by ID (today's sessions only)."""
+    manager = SessionManager()
+    for s in manager.get_today_sessions():
+        if s.session_id == session_id:
+            return s
+    raise HTTPException(status_code=404, detail="Session not found")

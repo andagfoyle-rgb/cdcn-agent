@@ -1,0 +1,64 @@
+# CDCN Agent — Caddy reverse proxy
+#
+# Provides TLS termination (auto HTTPS via Let's Encrypt or Tailscale),
+# static file caching, request logging, and slowloris protection.
+#
+# Installation:
+#   sudo apt install caddy
+#   sudo cp /opt/cdcn-agent/Caddyfile /etc/caddy/Caddyfile
+#   sudo systemctl enable --now caddy
+#
+# For local-only (Tailscale) access, use the Tailscale hostname:
+#   cdcn-agent.tail12345.ts.net
+#
+# For LAN-only access without TLS:
+#   :80
+
+# Replace with your Tailscale hostname or domain
+cdcn-agent.tail00000.ts.net {
+    # Reverse proxy to the agent
+    reverse_proxy localhost:8400 {
+        # WebSocket support
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+
+        # Timeouts — generous for streaming LLM responses
+        transport http {
+            read_timeout 300s
+            write_timeout 300s
+        }
+    }
+
+    # Static file caching (fonts, JS libs)
+    @static path /static/*
+    header @static Cache-Control "public, max-age=86400"
+
+    # Request logging
+    log {
+        output file /var/log/caddy/cdcn-agent.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        format json
+    }
+
+    # Rate limiting (basic — 30 req/s per IP)
+    # Requires caddy-ratelimit plugin; comment out if not installed
+    # rate_limit {remote.ip} 30r/s
+
+    # Security headers (supplement the agent's own headers)
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    }
+
+    # Timeouts to prevent slowloris
+    timeouts {
+        read_body   30s
+        read_header 10s
+        write       300s
+        idle        120s
+    }
+}

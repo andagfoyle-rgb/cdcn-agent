@@ -1,0 +1,693 @@
+"""
+Web interface adapter — login, chat UI, WebSocket endpoint, admin pages.
+
+Routes (mounted at root, no prefix):
+  GET  /              → single-page chat UI (requires auth cookie)
+  GET  /login         → login form
+  POST /login         → authenticate → set httponly JWT cookie → redirect /
+  GET  /logout        → clear cookie → redirect /login
+  GET  /chat.css      → stylesheet (same-origin, satisfies CSP default-src 'self')
+  GET  /chat.js       → WebSocket client JS
+  GET  /ws            → WebSocket chat endpoint (cookie-auth)
+  GET  /pending-changes → admin page listing pending agent changes
+
+WebSocket protocol:
+  Client sends:  {"message": "<text>"}
+  Server sends:  {"type": "token", "content": "<chunk>"}  (streaming)
+                 {"type": "done"}                          (end of response)
+                 {"type": "error", "detail": "<msg>"}
+"""
+from __future__ import annotations
+
+import json
+import logging
+
+from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+from app.auth.auth import ALGORITHM, authenticate_user, create_access_token, verify_token
+from app.config import settings
+from app.interfaces.base_adapter import BaseAdapter
+
+log = logging.getLogger(__name__)
+
+web_router = APIRouter()
+
+# ── Active WebSocket connections ───────────────────────────────────────────────
+# Keyed by session key ("web:<username>") so send_message() can push proactively.
+_active_ws: dict[str, WebSocket] = {}
+
+
+# ── Auth cookie helper ─────────────────────────────────────────────────────────
+
+def _get_user_from_cookie(request_or_ws) -> str | None:
+    """Validate the access_token cookie and return the username, or None."""
+    token = request_or_ws.cookies.get("access_token")
+    if not token:
+        return None
+    user = verify_token(token)
+    return user.username if user else None
+
+
+# ── Login ──────────────────────────────────────────────────────────────────────
+
+_LOGIN_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CDCN Agent \u2014 Sign In</title>
+  <link rel="stylesheet" href="/chat.css">
+</head>
+<body class="login-page">
+  <div class="login-box">
+    <h1>CDCN Agent</h1>
+    <form method="post" action="/login">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" required autofocus>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" required>
+      <button type="submit">Sign in</button>
+    </form>
+    {error}
+  </div>
+</body>
+</html>"""
+
+
+@web_router.get("/login", response_class=HTMLResponse)
+async def login_form():
+    return HTMLResponse(_LOGIN_HTML.format(error=""))
+
+
+@web_router.post("/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    username = str(form.get("username", ""))
+    password = str(form.get("password", ""))
+    user = authenticate_user(username, password)
+    if not user:
+        return HTMLResponse(
+            _LOGIN_HTML.format(error='<p class="error">Invalid credentials.</p>'),
+            status_code=401,
+        )
+    token = create_access_token(user)
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=3600,
+    )
+    return response
+
+
+@web_router.get("/logout")
+async def logout():
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie("access_token")
+    return response
+
+
+# ── Static assets ──────────────────────────────────────────────────────────────
+
+_CSS = """\
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #f5f5f5;
+  color: #222;
+  line-height: 1.5;
+}
+
+/* ── Login ── */
+.login-page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+}
+.login-box {
+  background: #fff;
+  padding: 2rem;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.12);
+  width: 320px;
+}
+.login-box h1 { margin-bottom: 1.5rem; font-size: 1.4rem; }
+.login-box label { display: block; margin-bottom: .3rem; font-size: .85rem; color: #555; }
+.login-box input {
+  width: 100%;
+  padding: .5rem .6rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  margin-bottom: 1rem;
+  font-size: 1rem;
+}
+.login-box button {
+  width: 100%;
+  padding: .6rem;
+  background: #1a73e8;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 1rem;
+  cursor: pointer;
+}
+.login-box button:hover { background: #1558b0; }
+.error { color: #c00; margin-top: .75rem; font-size: .85rem; }
+
+/* ── Chat layout ── */
+.app {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  height: 100vh;
+  overflow: hidden;
+}
+.sidebar {
+  background: #fff;
+  border-right: 1px solid #e0e0e0;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: .75rem;
+  overflow-y: auto;
+}
+.sidebar h2 { font-size: 1rem; color: #333; }
+.status-badge {
+  display: inline-block;
+  padding: .2rem .6rem;
+  border-radius: 12px;
+  font-size: .75rem;
+  font-weight: 600;
+}
+.status-badge.wake   { background: #d4edda; color: #155724; }
+.status-badge.dream  { background: #d1ecf1; color: #0c5460; }
+.status-badge.transitioning_to_dream,
+.status-badge.transitioning_to_wake { background: #fff3cd; color: #856404; }
+.sidebar nav { display: flex; flex-direction: column; gap: .25rem; margin-top: auto; }
+.sidebar nav a {
+  display: block;
+  padding: .4rem .5rem;
+  border-radius: 4px;
+  text-decoration: none;
+  color: #444;
+  font-size: .875rem;
+}
+.sidebar nav a:hover { background: #f0f0f0; }
+
+.chat-area {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: .75rem;
+}
+.msg {
+  max-width: 78%;
+  padding: .7rem 1rem;
+  border-radius: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.msg.user {
+  align-self: flex-end;
+  background: #1a73e8;
+  color: #fff;
+  border-bottom-right-radius: 2px;
+}
+.msg.agent {
+  align-self: flex-start;
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-bottom-left-radius: 2px;
+}
+.msg.system {
+  align-self: center;
+  background: transparent;
+  color: #999;
+  font-size: .8rem;
+  font-style: italic;
+  border: none;
+  max-width: 100%;
+}
+.input-area {
+  display: flex;
+  gap: .5rem;
+  padding: .75rem 1rem;
+  border-top: 1px solid #e0e0e0;
+  background: #fff;
+}
+.input-area textarea {
+  flex: 1;
+  padding: .55rem .75rem;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  resize: none;
+  font-size: .95rem;
+  font-family: inherit;
+}
+.input-area textarea:focus { outline: none; border-color: #1a73e8; }
+.input-area button {
+  padding: .55rem 1.1rem;
+  background: #1a73e8;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: .95rem;
+  align-self: flex-end;
+}
+.input-area button:hover { background: #1558b0; }
+.input-area button:disabled { background: #ccc; cursor: not-allowed; }
+#upload-label {
+  display: flex;
+  align-items: flex-end;
+  padding: .55rem .75rem;
+  background: #f1f3f4;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 1.2rem;
+  line-height: 1;
+  user-select: none;
+}
+#upload-label:hover { background: #e2e5e9; }
+
+/* ── Pending changes ── */
+.pending-page { max-width: 880px; margin: 2rem auto; padding: 0 1rem; }
+.pending-page h1 { margin-bottom: 1.25rem; }
+.pending-page .back { display: inline-block; margin-bottom: 1rem; color: #1a73e8; text-decoration: none; font-size: .9rem; }
+.change-card {
+  background: #fff;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin-bottom: .75rem;
+}
+.change-card h3 { margin-bottom: .4rem; font-size: 1rem; }
+.change-meta { font-size: .8rem; color: #666; margin-bottom: .5rem; }
+.change-status {
+  display: inline-block;
+  padding: .15rem .45rem;
+  border-radius: 10px;
+  font-size: .72rem;
+  font-weight: 600;
+}
+.change-status.pending  { background: #fff3cd; color: #856404; }
+.change-status.approved { background: #d4edda; color: #155724; }
+.change-status.rejected { background: #f8d7da; color: #721c24; }
+"""
+
+
+_JS = """\
+(function () {
+  'use strict';
+
+  var messages  = document.getElementById('messages');
+  var input     = document.getElementById('input');
+  var sendBtn   = document.getElementById('send');
+  var statusEl  = document.getElementById('status-badge');
+
+  // ── WebSocket ────────────────────────────────────────────────────────────
+  var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  var ws    = new WebSocket(proto + '//' + location.host + '/ws');
+
+  ws.onopen = function () {
+    appendMsg('system', 'Connected to CDCN Agent.');
+    input.disabled = false;
+    sendBtn.disabled = false;
+  };
+
+  ws.onclose = function () {
+    appendMsg('system', 'Disconnected. Reload to reconnect.');
+    input.disabled = true;
+    sendBtn.disabled = true;
+  };
+
+  ws.onerror = function () {
+    appendMsg('system', 'Connection error.');
+  };
+
+  // ── Message rendering ────────────────────────────────────────────────────
+  var currentAgentEl = null;
+
+  ws.onmessage = function (event) {
+    var data;
+    try { data = JSON.parse(event.data); } catch (e) { return; }
+
+    if (data.type === 'token') {
+      if (!currentAgentEl) {
+        currentAgentEl = appendMsg('agent', '');
+      }
+      currentAgentEl.textContent += data.content;
+      messages.scrollTop = messages.scrollHeight;
+
+    } else if (data.type === 'done') {
+      currentAgentEl = null;
+      sendBtn.disabled = false;
+      input.disabled = false;
+      input.focus();
+
+    } else if (data.type === 'error') {
+      appendMsg('system', 'Error: ' + (data.detail || 'unknown'));
+      sendBtn.disabled = false;
+      input.disabled = false;
+    }
+  };
+
+  function appendMsg(role, text) {
+    var el = document.createElement('div');
+    el.className = 'msg ' + role;
+    el.textContent = text;
+    messages.appendChild(el);
+    messages.scrollTop = messages.scrollHeight;
+    return el;
+  }
+
+  // ── Send ─────────────────────────────────────────────────────────────────
+  function sendMessage() {
+    var text = input.value.trim();
+    if (!text || ws.readyState !== WebSocket.OPEN) return;
+    appendMsg('user', text);
+    ws.send(JSON.stringify({ message: text }));
+    input.value = '';
+    sendBtn.disabled = true;
+    input.disabled = true;
+  }
+
+  sendBtn.addEventListener('click', sendMessage);
+
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  // ── Status polling ───────────────────────────────────────────────────────
+  function pollStatus() {
+    fetch('/api/status')
+      .then(function (r) { return r.json(); })
+      .then(function (s) {
+        var mode = (s.mode || 'unknown').replace(/_/g, '-');
+        statusEl.textContent = mode;
+        statusEl.className = 'status-badge ' + (s.mode || 'unknown');
+      })
+      .catch(function () {});
+  }
+
+  pollStatus();
+  setInterval(pollStatus, 30000);
+  // ── File upload ──────────────────────────────────────────────────────────
+  var uploadInput = document.getElementById('upload-input');
+  uploadInput.addEventListener('change', function () {
+    var files = Array.from(uploadInput.files);
+    if (!files.length) return;
+    appendMsg('system', 'Uploading ' + files.length + ' file(s)...');
+    var fd = new FormData();
+    var readers = files.map(function(file) {
+      return new Promise(function(resolve) {
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          var blob = new Blob([e.target.result], {type: file.type || 'application/octet-stream'});
+          fd.append('files', blob, file.name);
+          resolve();
+        };
+        reader.readAsArrayBuffer(file);
+      });
+    });
+    Promise.all(readers).then(function() {
+      fetch('/upload', { method: 'POST', body: fd })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          appendMsg('system', data.message || 'Upload complete.');
+        })
+        .catch(function () {
+          appendMsg('system', 'Upload failed.');
+        });
+    });
+    uploadInput.value = '';
+  });
+}());
+"""
+
+
+@web_router.get("/chat.css")
+async def serve_css():
+    return Response(content=_CSS, media_type="text/css; charset=utf-8")
+
+
+@web_router.get("/chat.js")
+async def serve_js():
+    return Response(content=_JS, media_type="application/javascript; charset=utf-8")
+
+
+# ── Chat UI ────────────────────────────────────────────────────────────────────
+
+_CHAT_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CDCN Agent</title>
+  <link rel="stylesheet" href="/chat.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <h2>CDCN Agent</h2>
+      <div>
+        Status:&nbsp;<span id="status-badge" class="status-badge">\u2026</span>
+      </div>
+      <nav>
+        <a href="/pending-changes">Pending Changes</a>
+        <a href="/logout">Sign out</a>
+      </nav>
+    </aside>
+    <main class="chat-area">
+      <div id="messages" class="messages"></div>
+      <div class="input-area">
+        <textarea
+          id="input"
+          rows="3"
+          placeholder="Type a message\u2026 (Enter to send, Shift+Enter for new line)"
+          disabled
+        ></textarea>
+        <button id="send" disabled>Send</button>
+        <label id="upload-label" title="Upload document">
+          📎
+          <input type="file" id="upload-input" accept=".pdf,.docx,.txt,.md" style="display:none" multiple>
+        </label>
+      </div>
+    </main>
+  </div>
+  <script src="/chat.js"></script>
+</body>
+</html>"""
+
+
+
+@web_router.post("/upload")
+async def upload_documents(request: Request, files: list = None):
+    import shutil
+    from pathlib import Path
+    from fastapi import UploadFile
+    user = _get_user_from_cookie(request)
+    if not user:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "unauthorised"}, status_code=401)
+    docs_dir = Path(settings.watched_folder)
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    form = await request.form()
+    saved = []
+    for field in form.values():
+        if hasattr(field, "filename") and field.filename:
+            dest = docs_dir / field.filename
+            data = await field.read()
+            log.info("Upload: file=%s size=%d", field.filename, len(data))
+            with dest.open("wb") as fh:
+                fh.write(data)
+            saved.append(field.filename)
+    from fastapi.responses import JSONResponse
+    if saved:
+        return JSONResponse({"message": f"Uploaded: {', '.join(saved)}. Indexing will run shortly."})
+    return JSONResponse({"message": "No files received."})
+
+@web_router.get("/", response_class=HTMLResponse)
+async def chat_ui(request: Request):
+    if not _get_user_from_cookie(request):
+        return RedirectResponse(url="/login", status_code=303)
+    return HTMLResponse(_CHAT_HTML)
+
+
+# ── WebSocket endpoint ─────────────────────────────────────────────────────────
+
+@web_router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    user = _get_user_from_cookie(websocket)
+    if not user:
+        await websocket.close(code=4001)
+        return
+
+    await websocket.accept()
+    session_key = f"web:{user}"
+    _active_ws[session_key] = websocket
+    log.info("WebSocket connected: user=%s", user)
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_text(
+                    json.dumps({"type": "error", "detail": "Invalid JSON"})
+                )
+                continue
+
+            message = str(data.get("message", "")).strip()
+            if not message:
+                continue
+
+            # Rest-mode guard
+            try:
+                from app.state_manager import get_state_manager
+                if not get_state_manager().is_accepting_messages():
+                    rest = (
+                        f"CDCN Agent is currently in rest mode and will be back online "
+                        f"at {settings.wake_start_time}."
+                    )
+                    await websocket.send_text(
+                        json.dumps({"type": "token", "content": rest})
+                    )
+                    await websocket.send_text(json.dumps({"type": "done"}))
+                    continue
+            except RuntimeError:
+                pass  # Manager not yet initialised — proceed
+
+            # Stream the agentic response
+            from app.gateway.router import _get_agent_router
+            router = _get_agent_router()
+            async for token in router.handle_message(
+                user_id=f"web:{user}",
+                role="admin",
+                message=message,
+                channel_id=session_key,
+            ):
+                await websocket.send_text(
+                    json.dumps({"type": "token", "content": token})
+                )
+            await websocket.send_text(json.dumps({"type": "done"}))
+
+    except WebSocketDisconnect:
+        log.info("WebSocket disconnected: user=%s", user)
+    except Exception as exc:
+        log.error("WebSocket error for user=%s: %s", user, exc)
+        try:
+            await websocket.send_text(
+                json.dumps({"type": "error", "detail": str(exc)})
+            )
+        except Exception:
+            pass
+    finally:
+        _active_ws.pop(session_key, None)
+
+
+# ── Pending changes admin page ─────────────────────────────────────────────────
+
+@web_router.get("/pending-changes", response_class=HTMLResponse)
+async def pending_changes_page(request: Request):
+    if not _get_user_from_cookie(request):
+        return RedirectResponse(url="/login", status_code=303)
+
+    from app.storage import pending_changes as pc
+    changes = pc.list_pending()
+
+    cards: list[str] = []
+    for c in changes:
+        status = c.get("status", "pending")
+        cards.append(
+            f'<div class="change-card">'
+            f'<h3>{c.get("title", "Untitled")}</h3>'
+            f'<div class="change-meta">'
+            f'ID: {c.get("id")} &middot; '
+            f'Author: {c.get("author", "agent")} &middot; '
+            f'Proposed: {str(c.get("proposed_at", ""))[:16]}'
+            f'&nbsp; <span class="change-status {status}">{status}</span>'
+            f"</div>"
+            f"</div>"
+        )
+
+    html = (
+        "<!DOCTYPE html>"
+        '<html lang="en"><head><meta charset="UTF-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>Pending Changes &mdash; CDCN Agent</title>"
+        '<link rel="stylesheet" href="/chat.css">'
+        "</head><body>"
+        '<div class="pending-page">'
+        "<h1>Pending Changes</h1>"
+        '<a class="back" href="/">\u2190 Back to chat</a>'
+        + ("".join(cards) if cards else "<p>No pending changes.</p>")
+        + "</div></body></html>"
+    )
+    return HTMLResponse(html)
+
+
+# ── WebAdapter ─────────────────────────────────────────────────────────────────
+
+
+class WebAdapter(BaseAdapter):
+    name = "web"
+
+    def __init__(self) -> None:
+        super().__init__(router=None)
+
+    async def start(self) -> None:
+        log.info("WebAdapter: routes registered via web_router.")
+
+    async def stop(self) -> None:
+        # Close any open WebSocket connections gracefully
+        for session_key, ws in list(_active_ws.items()):
+            try:
+                await ws.close(code=1001)
+            except Exception:
+                pass
+        _active_ws.clear()
+        log.info("WebAdapter: stopped.")
+
+    async def send_message(self, destination: str, text: str) -> None:
+        """Push a message to an active WebSocket session by its session key."""
+        ws = _active_ws.get(destination)
+        if ws:
+            try:
+                await ws.send_text(json.dumps({"type": "token", "content": text}))
+                await ws.send_text(json.dumps({"type": "done"}))
+            except Exception as exc:
+                log.debug("WebAdapter.send_message failed for %s: %s", destination, exc)
+
+    async def send_typing(self, channel_id: str) -> None:
+        # Tokens are streamed directly over WebSocket; no separate typing indicator needed.
+        pass
+
+
+def create_web_app() -> "WebAdapter":
+    """
+    Factory function that returns a ready-to-use WebAdapter instance.
+
+    Provided as a convenience for callers that expect a ``create_web_app()``
+    factory rather than instantiating ``WebAdapter`` directly.
+    """
+    return WebAdapter()

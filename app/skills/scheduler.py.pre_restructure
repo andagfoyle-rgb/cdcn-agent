@@ -1,0 +1,1458 @@
+"""
+SchedulerSkill — APScheduler-based recurring task runner for CDCN Agent.
+
+Adapts OpenCLAW's heartbeat pattern:
+  • heartbeat.md is the standing checklist, read on every run (like HEARTBEAT.md)
+  • The LLM receives current context + heartbeat.md instructions and decides
+    whether anything needs reporting.  If its reply begins or ends with
+    HEARTBEAT_OK (and is short), no notification is sent — matching OpenCLAW's
+    ack-suppression behaviour.
+  • Active-hours gate: all jobs check state_manager.is_accepting_messages()
+    before running, equivalent to OpenCLAW's activeHours window.
+  • Every job is wrapped in a try/except; exceptions are logged and the
+    scheduler continues — the runner never crashes.
+  • All jobs log start and completion to the audit log with elapsed duration.
+
+Jobs registered
+───────────────
+  heartbeat_job          — interval, HEARTBEAT_INTERVAL_HOURS (wake only)
+  auto_index_job         — interval, 6 h (wake only)
+  journal_job            — cron at JOURNAL_TIME (wake only)
+  weekly_digest_job      — cron Monday 07:15 (wake only)
+  monthly_governance_job — cron 1st of month 08:00 (always, logs if dream)
+  funding_feed_job       — cron 07:30 and 12:00 daily (wake only)
+  session_archive_job    — cron 03:00 daily (dream mode, NOT wake-gated)
+"""
+from __future__ import annotations
+
+import asyncio
+import functools
+import logging
+import shutil
+import tarfile
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from app.config import settings
+
+if TYPE_CHECKING:
+    pass
+
+log = logging.getLogger(__name__)
+
+
+def _with_retry(max_retries: int = 2, backoff_base: float = 5.0):
+    """Decorator that retries an async scheduler job on transient failure.
+
+    Retries up to max_retries times with exponential backoff.
+    Final failure is logged but not re-raised (scheduler must never crash).
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as exc:
+                    if attempt < max_retries:
+                        delay = backoff_base * (2 ** attempt)
+                        log.warning(
+                            "%s failed (attempt %d/%d), retrying in %.0fs: %s",
+                            fn.__name__, attempt + 1, max_retries + 1, delay, exc,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        log.error(
+                            "%s failed after %d attempts: %s",
+                            fn.__name__, max_retries + 1, exc, exc_info=True,
+                        )
+        return wrapper
+    return decorator
+
+# Token used by OpenCLAW to signal "nothing to report".
+# We adopt the same convention for the heartbeat LLM call.
+_HEARTBEAT_OK = "HEARTBEAT_OK"
+# Suppress notification if the stripped reply is under this many chars.
+_ACK_MAX_CHARS = 300
+
+_scheduler = AsyncIOScheduler()
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+
+def get_scheduler() -> AsyncIOScheduler:
+    return _scheduler
+
+
+def start_scheduler() -> None:
+    """Register all jobs and start the scheduler.  Safe to call only once."""
+    if _scheduler.running:
+        return
+
+    wake_h, wake_m = _parse_time(settings.wake_start_time)
+    sleep_h, sleep_m = _parse_time(settings.wake_end_time)
+    journal_h, journal_m = _parse_time(settings.journal_time)
+
+    # ── State transitions ────────────────────────────────────────────────────
+    _scheduler.add_job(
+        _wake_job,
+        CronTrigger(hour=wake_h, minute=wake_m),
+        id="wake",
+        replace_existing=True,
+    )
+    _scheduler.add_job(
+        _sleep_job,
+        CronTrigger(hour=sleep_h, minute=sleep_m),
+        id="sleep",
+        replace_existing=True,
+    )
+
+    # ── Heartbeat — interval, wake only ──────────────────────────────────────
+    _scheduler.add_job(
+        _heartbeat_job,
+        "interval",
+        hours=settings.heartbeat_interval_hours,
+        id="heartbeat",
+        replace_existing=True,
+    )
+
+    # ── Auto-index — every 6 h, wake only ────────────────────────────────────
+    _scheduler.add_job(
+        _auto_index_job,
+        "interval",
+        hours=6,
+        id="auto_index",
+        replace_existing=True,
+    )
+
+    # ── Journal — cron at JOURNAL_TIME, wake only ─────────────────────────────
+    _scheduler.add_job(
+        _journal_job,
+        CronTrigger(hour=journal_h, minute=journal_m),
+        id="journal",
+        replace_existing=True,
+    )
+
+    # ── Weekly digest — Monday 07:15, wake only ───────────────────────────────
+    _scheduler.add_job(
+        _weekly_digest_job,
+        CronTrigger(day_of_week="mon", hour=7, minute=15),
+        id="weekly_digest",
+        replace_existing=True,
+    )
+
+    # ── Monthly governance check — 1st of month 08:00 ─────────────────────────
+    _scheduler.add_job(
+        _monthly_governance_job,
+        CronTrigger(day=1, hour=8, minute=0),
+        id="monthly_governance",
+        replace_existing=True,
+    )
+
+    # ── Daily overdue check — 08:30 every day ─────────────────────────────────
+    _scheduler.add_job(
+        _overdue_check_job,
+        CronTrigger(hour=8, minute=30),
+        id="overdue_check",
+        replace_existing=True,
+    )
+
+    # ── Funding feed scan — 07:30 and 13:00 daily, wake only ────────────────
+    _scheduler.add_job(
+        _funding_feed_job,
+        CronTrigger(hour=7, minute=30),
+        id="funding_feed_am",
+        replace_existing=True,
+    )
+    _scheduler.add_job(
+        _funding_feed_job,
+        CronTrigger(hour=12, minute=0),
+        id="funding_feed_noon",
+        replace_existing=True,
+    )
+
+    # ── Session archive — 03:00 daily, NOT wake-gated (dream mode) ───────────
+    _scheduler.add_job(
+        _session_archive_job,
+        CronTrigger(hour=3, minute=0),
+        id="session_archive",
+        replace_existing=True,
+    )
+
+    # ── Nightly backup — 04:00 daily, NOT wake-gated ─────────────────────────
+    _scheduler.add_job(
+        _nightly_backup_job,
+        CronTrigger(hour=4, minute=0),
+        id="nightly_backup",
+        replace_existing=True,
+    )
+
+    # ── Backup verification — 05:00 daily, NOT wake-gated ─────────────────
+    _scheduler.add_job(
+        _backup_verify_job,
+        CronTrigger(hour=5, minute=0),
+        id="backup_verify",
+        replace_existing=True,
+    )
+
+    # ── Disk space monitor — 08:35 daily ──────────────────────────────────
+    _scheduler.add_job(
+        _disk_monitor_job,
+        CronTrigger(hour=8, minute=35),
+        id="disk_monitor",
+        replace_existing=True,
+    )
+
+    # ── Weekly DB maintenance — Sunday 02:00, NOT wake-gated ──────────────
+    _scheduler.add_job(
+        _db_maintenance_job,
+        CronTrigger(day_of_week="sun", hour=2, minute=0),
+        id="db_maintenance",
+        replace_existing=True,
+    )
+
+    _scheduler.start()
+    log.info("Scheduler started with %d jobs.", len(_scheduler.get_jobs()))
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def _parse_time(t: str) -> tuple[int, int]:
+    h, m = t.split(":")
+    return int(h), int(m)
+
+
+def _is_wake() -> bool:
+    """Return True only when the agent is fully in WAKE state."""
+    try:
+        from app.state_manager import get_state_manager
+        return get_state_manager().is_accepting_messages()
+    except Exception:
+        return True  # fail-open before state manager is wired up
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+async def _notify(message: str) -> None:
+    """
+    Send message to Discord status channel and Telegram notification chat.
+
+    Mirrors AgentStateManager._broadcast_sleep_notice().
+    Errors are logged and swallowed — never raise from a notification.
+    """
+    try:
+        from app.state_manager import get_state_manager
+        mgr = get_state_manager()
+        discord = mgr._discord
+        telegram = mgr._telegram
+    except Exception as exc:
+        log.warning("_notify: could not resolve adapters: %s", exc)
+        return
+
+    if discord:
+        try:
+            status_id = settings.discord_status_channel_id
+            if status_id:
+                await discord.send_message(status_id, message)
+        except Exception as exc:
+            log.warning("_notify: Discord send failed: %s", exc)
+
+    if telegram:
+        try:
+            chat_id = settings.telegram_notification_chat_id
+            if chat_id:
+                await telegram.send_message(chat_id, message)
+        except Exception as exc:
+            log.warning("_notify: Telegram send failed: %s", exc)
+
+
+async def _audit_start(job_id: str) -> None:
+    try:
+        from app.storage.audit_log import log_event
+        await log_event(actor="scheduler", action=f"{job_id}:start", detail=_now_iso())
+    except Exception as exc:
+        log.debug("audit start failed: %s", exc)
+
+
+async def _audit_end(job_id: str, duration_ms: int, detail: str = "") -> None:
+    try:
+        from app.storage.audit_log import log_event
+        await log_event(
+            actor="scheduler",
+            action=f"{job_id}:complete",
+            detail=f"duration_ms={duration_ms} {detail}".strip(),
+        )
+    except Exception as exc:
+        log.debug("audit end failed: %s", exc)
+
+
+def _is_heartbeat_ok(text: str) -> bool:
+    """
+    Return True if the LLM reply is a HEARTBEAT_OK acknowledgment that
+    should be suppressed — matching OpenCLAW's ack-suppression logic.
+
+    A reply is treated as OK if:
+      - It starts OR ends with HEARTBEAT_OK (after stripping whitespace), AND
+      - The remaining content is ≤ _ACK_MAX_CHARS characters.
+    """
+    stripped = text.strip()
+    if stripped == _HEARTBEAT_OK:
+        return True
+    remainder = stripped
+    if stripped.startswith(_HEARTBEAT_OK):
+        remainder = stripped[len(_HEARTBEAT_OK):].strip()
+    elif stripped.endswith(_HEARTBEAT_OK):
+        remainder = stripped[: -len(_HEARTBEAT_OK)].strip()
+    else:
+        return False
+    return len(remainder) <= _ACK_MAX_CHARS
+
+
+def _build_doc_context() -> str:
+    """
+    Summarise the current ChromaDB collection: total chunks and counts by type.
+    Returns a short markdown string safe to embed in an LLM prompt.
+    """
+    try:
+        from app.storage.vector_store import vector_store
+        docs = vector_store.list_documents()
+        if not docs:
+            return "Document archive: empty."
+        type_counts: Counter[str] = Counter(d.get("document_type", "other") for d in docs)
+        lines = [f"Document archive: {len(docs)} document(s) indexed."]
+        for doc_type, count in sorted(type_counts.items()):
+            lines.append(f"  - {doc_type}: {count}")
+        return "\n".join(lines)
+    except Exception as exc:
+        log.debug("_build_doc_context failed: %s", exc)
+        return "Document archive: unavailable."
+
+
+def _load_funding_deadlines_text() -> str:
+    """Return raw text of funding_deadlines.yaml, or a placeholder."""
+    path = Path("skills_config/funding_deadlines.yaml")
+    try:
+        return path.read_text() if path.exists() else "(funding_deadlines.yaml not found)"
+    except OSError:
+        return "(could not read funding_deadlines.yaml)"
+
+
+def _load_heartbeat_instructions() -> str:
+    """Read skills_config/memory/heartbeat.md — the standing task checklist."""
+    path = Path("skills_config/memory/heartbeat.md")
+    try:
+        return path.read_text() if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def _funding_deadlines_within_days(n_days: int) -> list[str]:
+    """
+    Return alert strings for funding deadlines within the next n_days.
+    Skips submitted / awarded / declined entries.
+    """
+    path = Path("skills_config/funding_deadlines.yaml")
+    if not path.exists():
+        return []
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text()) or {}
+    except Exception as exc:
+        log.warning("Could not parse funding_deadlines.yaml: %s", exc)
+        return []
+
+    today = datetime.now().date()
+    skip_statuses = {"submitted", "awarded", "declined"}
+    alerts: list[str] = []
+
+    for item in data.get("deadlines", []):
+        deadline_str = str(item.get("deadline", "")).strip()
+        if not deadline_str or item.get("status", "") in skip_statuses:
+            continue
+        try:
+            deadline_date = datetime.strptime(deadline_str, "%Y-%m-%d").date()
+            days = (deadline_date - today).days
+            if 0 <= days <= n_days:
+                funder = item.get("funder", "[funder]")
+                programme = item.get("programme", item.get("program", "[programme]"))
+                alerts.append(
+                    f"**Funding deadline approaching:** {funder} — {programme} "
+                    f"— deadline {deadline_date.strftime('%d %B %Y')} ({days} days)."
+                )
+        except ValueError:
+            pass
+
+    return alerts
+
+
+def _read_session_log_today() -> str:
+    """Read today's session log file; return empty string if absent."""
+    path = Path(settings.memory_path) / "session_log" / f"{_today()}.md"
+    try:
+        return path.read_text() if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def _docs_indexed_since(cutoff: datetime) -> list[dict]:
+    """Return list_documents() entries indexed after cutoff."""
+    try:
+        from app.storage.vector_store import vector_store
+        docs = vector_store.list_documents()
+        result = []
+        for d in docs:
+            ts_str = d.get("indexed_at", "")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if ts >= cutoff:
+                    result.append(d)
+            except ValueError:
+                pass
+        return result
+    except Exception as exc:
+        log.debug("_docs_indexed_since failed: %s", exc)
+        return []
+
+
+# ── State transition jobs ──────────────────────────────────────────────────────
+
+
+async def _wake_job() -> None:
+    from app.state_manager import get_state_manager, AgentState
+    manager = get_state_manager()
+    if manager.current_state == AgentState.DREAM:
+        log.info("Scheduled wake: triggering transition_to_wake")
+        await manager.transition_to_wake()
+    else:
+        log.info("Scheduled wake: already in %s — no transition needed", manager.current_state)
+
+
+async def _sleep_job() -> None:
+    from app.state_manager import get_state_manager, AgentState
+    manager = get_state_manager()
+    if manager.current_state == AgentState.WAKE:
+        log.info("Scheduled sleep: triggering transition_to_dream")
+        await manager.transition_to_dream()
+    else:
+        log.info("Scheduled sleep: already in %s — no transition needed", manager.current_state)
+
+
+# ── Job 1 — heartbeat_job ──────────────────────────────────────────────────────
+
+
+@_with_retry(max_retries=2, backoff_base=10.0)
+async def _heartbeat_job() -> None:
+    """
+    Periodic heartbeat — adapts OpenCLAW's HEARTBEAT.md pattern.
+
+    Flow:
+      1. Gate: skip if not in wake state (matches OpenCLAW activeHours gate).
+      2. Read heartbeat.md instructions (the standing checklist).
+      3. Run the indexer and deadline check to gather fresh context.
+      4. Build an LLM prompt: heartbeat.md + runtime context.
+      5. Call LLM.  If reply is HEARTBEAT_OK → log only, no notification
+         (matches OpenCLAW ack-suppression).
+      6. Otherwise send the report to Discord + Telegram.
+      7. Log start / completion with duration to audit_log.
+    """
+    if not _is_wake():
+        log.debug("heartbeat_job: not in wake state — skipped")
+        return
+
+    t0 = time.monotonic()
+    await _audit_start("heartbeat")
+    log.info("heartbeat_job: starting")
+
+    try:
+        # ── Gather context ────────────────────────────────────────────────────
+        instructions = _load_heartbeat_instructions()
+        doc_context = _build_doc_context()
+        now_str = datetime.now(timezone.utc).strftime("%A %d %B %Y, %H:%M UTC")
+
+        # Run indexer to pick up new files
+        indexer_summary = ""
+        try:
+            from app.skills.indexer import IndexerSkill
+            idx_result = await IndexerSkill().run(folder=settings.watched_folder)
+            if idx_result.success and idx_result.metadata:
+                m = idx_result.metadata
+                indexer_summary = (
+                    f"Indexer run: {m.get('indexed', 0)} indexed, "
+                    f"{m.get('skipped', 0)} skipped, "
+                    f"{m.get('failed', 0)} failed."
+                )
+            elif idx_result.error:
+                indexer_summary = f"Indexer error: {idx_result.error}"
+        except Exception as exc:
+            indexer_summary = f"Indexer unavailable: {exc}"
+            log.warning("heartbeat_job: indexer failed: %s", exc)
+
+        # Check funding deadlines (14-day window as specified in heartbeat.md)
+        deadline_alerts = _funding_deadlines_within_days(14)
+        deadline_text = (
+            "\n".join(deadline_alerts)
+            if deadline_alerts
+            else "No funding deadlines within 14 days."
+        )
+
+        # Check RSS feed opportunities (last 3 days, high relevance)
+        rss_text = ""
+        try:
+            from app.skills.funding_feed import get_recent_opportunities
+            rss_opps = await get_recent_opportunities(n=5, relevance="high", days=3)
+            if rss_opps:
+                rss_lines = [f"**{len(rss_opps)} high-relevance RSS funding opportunity/ies (last 3 days):**"]
+                for o in rss_opps:
+                    line = f"- {o['title']} ({o['funder']})"
+                    if o.get("deadline"):
+                        line += f" — deadline {o['deadline']}"
+                    rss_lines.append(line)
+                rss_text = "\n".join(rss_lines)
+        except Exception as exc:
+            log.debug("heartbeat: RSS feed check failed: %s", exc)
+
+        # ── Build LLM prompt ──────────────────────────────────────────────────
+        # System prompt mirrors OpenCLAW: "Read HEARTBEAT.md strictly"
+        system_prompt = (
+            "You are CDCN Agent's heartbeat worker. "
+            "Follow the heartbeat instructions strictly. "
+            "Report only what genuinely needs attention. "
+            f"If nothing needs attention, reply with exactly: {_HEARTBEAT_OK}"
+        )
+
+        user_content_parts = [
+            f"**Current time:** {now_str}",
+            "",
+        ]
+        if instructions:
+            user_content_parts += [
+                "## Heartbeat Instructions (heartbeat.md)",
+                instructions,
+                "",
+            ]
+        # Disk space check
+        disk_warning = ""
+        try:
+            usage = shutil.disk_usage("/")
+            free_gb = usage.free / (1024 ** 3)
+            total_gb = usage.total / (1024 ** 3)
+            pct_used = (usage.used / usage.total) * 100
+            if free_gb < 2.0:
+                disk_warning = (
+                    f"**⚠ DISK SPACE CRITICAL:** {free_gb:.1f} GB free "
+                    f"of {total_gb:.1f} GB ({pct_used:.0f}% used). "
+                    f"Immediate action required."
+                )
+            elif free_gb < 5.0:
+                disk_warning = (
+                    f"**Disk space low:** {free_gb:.1f} GB free "
+                    f"of {total_gb:.1f} GB ({pct_used:.0f}% used)."
+                )
+        except Exception as exc:
+            log.debug("heartbeat: disk check failed: %s", exc)
+
+        user_content_parts += [
+            "## Runtime Context",
+            doc_context,
+            "",
+            f"**Document indexer result:** {indexer_summary}",
+        ]
+        if disk_warning:
+            user_content_parts += ["", "## Disk Space", disk_warning]
+        user_content_parts += [
+            "",
+            "## Funding Deadlines",
+            deadline_text,
+        ]
+        if rss_text:
+            user_content_parts += ["", "## RSS Funding Opportunities", rss_text]
+        user_content = "\n".join(user_content_parts)
+
+        # ── Call LLM ─────────────────────────────────────────────────────────
+        from app.llm_client import llm_client
+        response = await llm_client.chat(
+            [{"role": "user", "content": user_content}],
+            system_prompt=system_prompt,
+            skill_used="heartbeat",
+        )
+
+        duration_ms = int((time.monotonic() - t0) * 1000)
+
+        # ── Suppress or notify — OpenCLAW ack-suppression pattern ─────────────
+        if _is_heartbeat_ok(response):
+            log.info("heartbeat_job: HEARTBEAT_OK — nothing to report (duration=%dms)", duration_ms)
+            await _audit_end("heartbeat", duration_ms, "result=ok")
+        else:
+            log.info("heartbeat_job: sending report (duration=%dms)", duration_ms)
+            report = f"**CDCN Agent — Heartbeat Report**\n\n{response.strip()}"
+            await _notify(report)
+            await _audit_end("heartbeat", duration_ms, "result=reported")
+
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.exception("heartbeat_job: unhandled error after %dms: %s", duration_ms, exc)
+        await _audit_end("heartbeat", duration_ms, f"error={exc!r}")
+
+
+# ── Job 2 — auto_index_job ─────────────────────────────────────────────────────
+
+
+@_with_retry(max_retries=2, backoff_base=10.0)
+async def _auto_index_job() -> None:
+    """
+    Auto-index: run DocumentIndexerSkill against WATCHED_FOLDER every 6 hours.
+    Wake-only; logs results to audit_log.
+    """
+    if not _is_wake():
+        log.debug("auto_index_job: not in wake state — skipped")
+        return
+
+    t0 = time.monotonic()
+    await _audit_start("auto_index")
+    log.info("auto_index_job: starting")
+
+    try:
+        from app.skills.indexer import IndexerSkill
+        result = await IndexerSkill().run(folder=settings.watched_folder)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+
+        if result.success:
+            m = result.metadata or {}
+            detail = (
+                f"indexed={m.get('indexed', 0)} "
+                f"skipped={m.get('skipped', 0)} "
+                f"failed={m.get('failed', 0)}"
+            )
+            log.info("auto_index_job: complete in %dms — %s", duration_ms, detail)
+            await _audit_end("auto_index", duration_ms, detail)
+        else:
+            log.warning("auto_index_job: failed — %s", result.error)
+            await _audit_end("auto_index", duration_ms, f"error={result.error!r}")
+
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.exception("auto_index_job: unhandled error after %dms: %s", duration_ms, exc)
+        await _audit_end("auto_index", duration_ms, f"error={exc!r}")
+
+
+# ── Job 3 — journal_job ────────────────────────────────────────────────────────
+
+
+@_with_retry(max_retries=1, backoff_base=5.0)
+async def _journal_job() -> None:
+    """
+    Nightly journal: summarise today's sessions, ask the LLM the three
+    reflective questions, then write to data/memory/journal/YYYY-MM-DD.md.
+
+    Runs just before transition_to_dream (scheduler ordering by JOURNAL_TIME).
+    Wake-only.
+    """
+    if not _is_wake():
+        log.debug("journal_job: not in wake state — skipped")
+        return
+
+    t0 = time.monotonic()
+    await _audit_start("journal")
+    log.info("journal_job: starting")
+
+    try:
+        from app.llm_client import llm_client
+        from app.skills.memory import MemorySkill
+
+        memory = MemorySkill()
+        today = _today()
+
+        # Build today's activity context from session log
+        session_log = _read_session_log_today()
+        recent_journal = memory.read_recent_journal(n_days=1).output or ""
+
+        context = (
+            f"**Date:** {today}\n\n"
+            f"## Today's session log\n\n{session_log or '(no sessions today)'}\n\n"
+            f"## Recent journal\n\n{recent_journal or '(no recent entries)'}"
+        )
+
+        system_prompt = (
+            "You are CDCN Agent, an AI assistant for a Scottish community development charity. "
+            "Write a first-person journal entry for today based on the session log below. "
+            "Answer these three questions in your entry:\n"
+            "  1. What did you work on today?\n"
+            "  2. What was difficult or uncertain?\n"
+            "  3. What do you want to remember for tomorrow?\n\n"
+            "Be concise (5–8 sentences). Write in past tense. "
+            "If there were no notable sessions, note that briefly."
+        )
+
+        entry = await llm_client.chat(
+            [{"role": "user", "content": context}],
+            system_prompt=system_prompt,
+            skill_used="journal",
+        )
+
+        memory.write_journal(date=today, content=entry)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.info("journal_job: complete in %dms", duration_ms)
+        await _audit_end("journal", duration_ms)
+
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.exception("journal_job: unhandled error after %dms: %s", duration_ms, exc)
+        await _audit_end("journal", duration_ms, f"error={exc!r}")
+
+
+# ── Job 4 — weekly_digest_job ──────────────────────────────────────────────────
+
+
+async def _weekly_digest_job() -> None:
+    """
+    Monday 07:15 — post a weekly digest to Discord.
+
+    Contents:
+      • Summary of recent board minutes (via SearchSkill)
+      • Funding deadlines in the next 60 days
+      • Documents indexed in the past 7 days
+    Wake-only.
+    """
+    if not _is_wake():
+        log.debug("weekly_digest_job: not in wake state — skipped")
+        return
+
+    t0 = time.monotonic()
+    await _audit_start("weekly_digest")
+    log.info("weekly_digest_job: starting")
+
+    try:
+        from app.llm_client import llm_client
+        from app.skills.search import SearchSkill
+
+        # ── 1. Recent board minutes ───────────────────────────────────────────
+        minutes_summary = ""
+        try:
+            search = SearchSkill()
+            search_result = await search.run(query="board minutes decisions resolutions")
+            if search_result.success and search_result.metadata.get("hits", 0) > 0:
+                minutes_summary = search_result.output or ""
+        except Exception as exc:
+            log.warning("weekly_digest_job: minutes search failed: %s", exc)
+            minutes_summary = "(board minutes search unavailable)"
+
+        # ── 2. Funding deadlines — next 60 days ───────────────────────────────
+        deadline_alerts = _funding_deadlines_within_days(60)
+        deadline_text = (
+            "\n".join(f"- {a}" for a in deadline_alerts)
+            if deadline_alerts
+            else "- No funding deadlines in the next 60 days."
+        )
+
+        # ── 3. RSS funding opportunities (past 7 days) ──────────────────────
+        rss_text = "- No RSS funding opportunities in the past 7 days."
+        try:
+            from app.skills.funding_feed import get_recent_opportunities
+            rss_opps = await get_recent_opportunities(n=20, days=7)
+            if rss_opps:
+                high = [o for o in rss_opps if o.get("relevance") == "high"]
+                med = [o for o in rss_opps if o.get("relevance") == "medium"]
+                rss_lines = [f"- {len(rss_opps)} funding opportunity/ies found via RSS feeds:"]
+                if high:
+                    rss_lines.append(f"  - **{len(high)} high-relevance:**")
+                    for o in high[:5]:
+                        line = f"    - {o['title']} ({o['funder']})"
+                        if o.get("deadline"):
+                            line += f" — deadline {o['deadline']}"
+                        rss_lines.append(line)
+                if med:
+                    rss_lines.append(f"  - {len(med)} medium-relevance")
+                low_count = len(rss_opps) - len(high) - len(med)
+                if low_count:
+                    rss_lines.append(f"  - {low_count} low-relevance (filtered)")
+                rss_text = "\n".join(rss_lines)
+        except Exception as exc:
+            log.warning("weekly_digest_job: RSS feed query failed: %s", exc)
+            rss_text = "- RSS funding feed data unavailable."
+
+        # ── 4. Documents indexed in the past 7 days ───────────────────────────
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        recent_docs = _docs_indexed_since(cutoff)
+        if recent_docs:
+            type_counts: Counter[str] = Counter(d.get("document_type", "other") for d in recent_docs)
+            doc_lines = [f"- {len(recent_docs)} document(s) indexed in the past 7 days:"]
+            for dt, n in sorted(type_counts.items()):
+                doc_lines.append(f"  - {dt}: {n}")
+            doc_text = "\n".join(doc_lines)
+        else:
+            doc_text = "- No new documents indexed in the past 7 days."
+
+        # ── Ask LLM to write a clean digest ───────────────────────────────────
+        user_content = (
+            f"**Week ending:** {_today()}\n\n"
+            f"## Board minutes / recent decisions\n\n{minutes_summary or '(no results)'}\n\n"
+            f"## Funding deadlines (next 60 days)\n\n{deadline_text}\n\n"
+            f"## RSS funding opportunities (past 7 days)\n\n{rss_text}\n\n"
+            f"## Document activity (past 7 days)\n\n{doc_text}"
+        )
+        system_prompt = (
+            "You are CDCN Agent. Produce a concise weekly digest (5–8 bullet points) "
+            "for the board of a Scottish community development charity. "
+            "Cover: documents indexed, any board decisions found, "
+            "funding deadlines approaching, new RSS funding opportunities, "
+            "and any outstanding follow-ups. "
+            "Use plain English. Format as a Discord message with markdown."
+        )
+
+        digest = await llm_client.chat(
+            [{"role": "user", "content": user_content}],
+            system_prompt=system_prompt,
+            skill_used="weekly_digest",
+        )
+
+        # ── Post to Discord only (weekly digest is a board-facing summary) ────
+        discord_message = f"**CDCN Agent — Weekly Digest ({_today()})**\n\n{digest.strip()}"
+        try:
+            from app.state_manager import get_state_manager
+            mgr = get_state_manager()
+            if mgr._discord and settings.discord_status_channel_id:
+                await mgr._discord.send_message(
+                    settings.discord_status_channel_id, discord_message
+                )
+        except Exception as exc:
+            log.warning("weekly_digest_job: Discord post failed: %s", exc)
+
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.info("weekly_digest_job: complete in %dms", duration_ms)
+        await _audit_end("weekly_digest", duration_ms)
+
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.exception("weekly_digest_job: unhandled error after %dms: %s", duration_ms, exc)
+        await _audit_end("weekly_digest", duration_ms, f"error={exc!r}")
+
+
+# ── Job 5 — monthly_governance_job ────────────────────────────────────────────
+
+
+class SchedulerSkill:
+    """Thin wrapper exposing the scheduler start/stop API as a skill-like object."""
+    name = "scheduler"
+    description = "APScheduler-based recurring task runner."
+
+    def start(self) -> None:
+        start_scheduler()
+
+    def get_scheduler(self) -> AsyncIOScheduler:
+        return _scheduler
+
+
+async def _monthly_governance_job() -> None:
+    """
+    1st of month, 08:00 — governance document review reminder.
+
+    Queries ChromaDB for policy documents, flags any whose indexed_at is
+    older than 12 months (as a proxy for needing a review), and posts a
+    reminder to Discord and Telegram.
+
+    This job always runs (not wake-gated) because it is a monthly reminder
+    that should not be silently skipped.  It logs a warning if called during
+    dream state so operators can investigate scheduling issues.
+    """
+    if not _is_wake():
+        log.warning(
+            "monthly_governance_job: running outside wake state — "
+            "reminder will be sent anyway"
+        )
+
+    t0 = time.monotonic()
+    await _audit_start("monthly_governance")
+    log.info("monthly_governance_job: starting")
+
+    try:
+        from app.storage.vector_store import vector_store
+
+        # ── Fetch policy documents ─────────────────────────────────────────────
+        all_docs = vector_store.list_documents()
+        policy_docs = [d for d in all_docs if d.get("document_type") == "policy"]
+
+        month_label = datetime.now().strftime("%B %Y")
+        cutoff = datetime.now(timezone.utc) - timedelta(days=365)
+
+        stale: list[dict] = []
+        for doc in policy_docs:
+            ts_str = doc.get("indexed_at", "")
+            if not ts_str:
+                # No timestamp — treat as potentially stale
+                stale.append(doc)
+                continue
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                if ts < cutoff:
+                    stale.append(doc)
+            except ValueError:
+                stale.append(doc)
+
+        # ── Build reminder message ────────────────────────────────────────────
+        if not policy_docs:
+            body = (
+                f"**Governance Review — {month_label}**\n\n"
+                "No governance policy documents are currently indexed. "
+                "Consider uploading safeguarding, finance, and other policies "
+                "to the document archive."
+            )
+        elif not stale:
+            body = (
+                f"**Governance Review — {month_label}**\n\n"
+                f"All {len(policy_docs)} indexed governance policy document(s) "
+                "were indexed within the past 12 months. No immediate review required."
+            )
+        else:
+            lines = [
+                f"**Governance Review Reminder — {month_label}**\n",
+                f"{len(stale)} of {len(policy_docs)} policy document(s) "
+                "have not been refreshed in the past 12 months and may need review:\n",
+            ]
+            for doc in stale[:20]:  # cap at 20 to avoid oversized messages
+                source = doc.get("source_file", doc.get("doc_id", "unknown"))
+                lines.append(f"- `{source}`")
+            if len(stale) > 20:
+                lines.append(f"- … and {len(stale) - 20} more.")
+            lines.append(
+                "\nPlease review these documents and re-upload updated versions "
+                "to the document archive."
+            )
+            body = "\n".join(lines)
+
+        # ── Write reminder to journal ─────────────────────────────────────────
+        try:
+            from app.skills.memory import MemorySkill
+            memory = MemorySkill()
+            journal_content = (
+                f"## Governance Review Reminder — {month_label}\n\n{body}"
+            )
+            memory.write_journal(date=_today(), content=journal_content)
+        except Exception as exc:
+            log.warning("monthly_governance_job: journal write failed: %s", exc)
+
+        # ── Notify Discord + Telegram ─────────────────────────────────────────
+        await _notify(body)
+
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.info("monthly_governance_job: complete in %dms (%d stale)", duration_ms, len(stale))
+        await _audit_end(
+            "monthly_governance",
+            duration_ms,
+            f"policy_docs={len(policy_docs)} stale={len(stale)}",
+        )
+
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.exception("monthly_governance_job: unhandled error after %dms: %s", duration_ms, exc)
+        await _audit_end("monthly_governance", duration_ms, f"error={exc!r}")
+
+
+# ── Job: daily overdue check ─────────────────────────────────────────────────
+
+
+@_with_retry(max_retries=2, backoff_base=10.0)
+async def _funding_feed_job() -> None:
+    """
+    Fetch all configured RSS funding feeds, store new entries, and notify
+    Discord + Telegram if high-relevance opportunities are found.
+    Wake-only.
+    """
+    if not _is_wake():
+        log.debug("funding_feed_job: not in wake state — skipped")
+        return
+
+    t0 = time.monotonic()
+    await _audit_start("funding_feed")
+    log.info("funding_feed_job: starting")
+
+    try:
+        from app.skills.funding_feed import fetch_all_feeds, _mark_notified
+
+        result = await fetch_all_feeds()
+        duration_ms = int((time.monotonic() - t0) * 1000)
+
+        new_items = result.get("new_items", [])
+        if new_items:
+            # Build notification for high/medium relevance new items
+            notable = [i for i in new_items if i.get("relevance") in ("high", "medium")]
+            if notable:
+                lines = [
+                    f"**Funding Feed — {len(notable)} new opportunity/ies found:**\n"
+                ]
+                for item in notable[:8]:
+                    emoji = "🔴" if item["relevance"] == "high" else "🟡"
+                    line = f"{emoji} **{item['title']}** ({item['funder']})"
+                    if item.get("deadline"):
+                        line += f" — deadline {item['deadline']}"
+                    if item.get("link"):
+                        line += f"\n   {item['link']}"
+                    lines.append(line)
+                if len(notable) > 8:
+                    lines.append(f"…and {len(notable) - 8} more.")
+                await _notify("\n".join(lines))
+
+            # Mark all new items as notified
+            ids_to_mark = [i["id"] for i in new_items if "id" in i]
+            await _mark_notified(ids_to_mark)
+
+        detail = (
+            f"feeds={result['feeds_checked']} "
+            f"skipped={result['feeds_skipped']} "
+            f"entries={result['total_entries']} "
+            f"new={result['new_opportunities']} "
+            f"high={result['high_relevance']}"
+        )
+        log.info("funding_feed_job: complete in %dms — %s", duration_ms, detail)
+        await _audit_end("funding_feed", duration_ms, detail)
+
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.exception("funding_feed_job: unhandled error after %dms: %s", duration_ms, exc)
+        await _audit_end("funding_feed", duration_ms, f"error={exc!r}")
+
+
+async def _overdue_check_job() -> None:
+    """
+    Run daily at 08:30. Marks overdue deadlines and posts a warning to web chat
+    if any are found.
+    """
+    import time as _time
+    t0 = _time.monotonic()
+    await _audit_start("overdue_check")
+    log.info("overdue_check_job: starting")
+
+    try:
+        from app.skills.deadline_tracker import check_overdue
+        overdue = await check_overdue()
+
+        duration_ms = int((_time.monotonic() - t0) * 1000)
+
+        if not overdue:
+            log.info("overdue_check_job: no overdue deadlines (duration=%dms)", duration_ms)
+            await _audit_end("overdue_check", duration_ms, "result=none")
+            return
+
+        lines = [f"⚠️ **{len(overdue)} overdue deadline(s):**\n"]
+        for d in overdue[:10]:
+            lines.append(f"🔴 **{d['title']}** — was due {d['due_date']} ({d['category']})")
+        if len(overdue) > 10:
+            lines.append(f"…and {len(overdue) - 10} more. See /deadlines for the full list.")
+        lines.append("\nVisit [/deadlines](/deadlines) to update or defer these items.")
+        msg = "\n".join(lines)
+
+        await _notify(msg)
+        log.info("overdue_check_job: reported %d overdue (duration=%dms)", len(overdue), duration_ms)
+        await _audit_end("overdue_check", duration_ms, f"overdue={len(overdue)}")
+
+    except Exception as exc:
+        duration_ms = int((_time.monotonic() - t0) * 1000)
+        log.exception("overdue_check_job: error after %dms: %s", duration_ms, exc)
+        await _audit_end("overdue_check", duration_ms, f"error={exc!r}")
+
+
+# ── Job: session archive / cleanup ───────────────────────────────────────────
+
+
+async def _session_archive_job() -> None:
+    """
+    Daily at 03:00 (dream mode) — compress old session_log directories.
+
+    NOT wake-gated: this is a housekeeping task that runs during dream mode.
+
+    Flow:
+      1. Scan data/memory/session_log/ for JSON files older than
+         settings.session_archive_days (default 90).
+      2. Group files by month (YYYY-MM).
+      3. For each month, create a .tar.gz in data/memory/session_archive/.
+         If the archive already exists, append new files to a fresh archive
+         that includes the old contents.
+      4. Delete original JSON files after successful archive.
+      5. Log results to audit_log.
+    """
+    t0 = time.monotonic()
+    await _audit_start("session_archive")
+    log.info("session_archive_job: starting")
+
+    try:
+        session_log_dir = Path(settings.memory_path) / "session_log"
+        archive_dir = Path(settings.memory_path) / "session_archive"
+
+        if not session_log_dir.exists():
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            log.info("session_archive_job: session_log dir does not exist — nothing to do")
+            await _audit_end("session_archive", duration_ms, "result=no_session_log_dir")
+            return
+
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        cutoff = datetime.now() - timedelta(days=settings.session_archive_days)
+        cutoff_ts = cutoff.timestamp()
+
+        # ── Collect eligible files grouped by month ──────────────────────────
+        month_files: dict[str, list[Path]] = defaultdict(list)
+        for f in session_log_dir.iterdir():
+            if not f.is_file():
+                continue
+            # Use file modification time to determine age
+            if f.stat().st_mtime >= cutoff_ts:
+                continue
+            # Determine month bucket from filename (YYYY-MM-DD.*) or mtime
+            month_key = _extract_month_key(f)
+            month_files[month_key].append(f)
+
+        if not month_files:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            log.info("session_archive_job: no files older than %d days", settings.session_archive_days)
+            await _audit_end("session_archive", duration_ms, "result=none_eligible")
+            return
+
+        # ── Archive each month bucket ────────────────────────────────────────
+        total_archived = 0
+        total_deleted = 0
+        months_processed = 0
+
+        for month_key in sorted(month_files.keys()):
+            files = month_files[month_key]
+            archive_name = f"sessions_{month_key}.tar.gz"
+            archive_path = archive_dir / archive_name
+            tmp_path = archive_dir / f".tmp_{archive_name}"
+
+            try:
+                # If archive already exists, copy existing contents into new archive
+                existing_members: list[str] = set()
+                if archive_path.exists():
+                    with tarfile.open(archive_path, "r:gz") as existing_tar:
+                        existing_members = {m.name for m in existing_tar.getmembers()}
+
+                with tarfile.open(tmp_path, "w:gz") as tar:
+                    # Re-pack existing archive contents if present
+                    if archive_path.exists():
+                        with tarfile.open(archive_path, "r:gz") as old_tar:
+                            for member in old_tar.getmembers():
+                                tar.addfile(member, old_tar.extractfile(member))
+
+                    # Add new files
+                    added = 0
+                    for f in files:
+                        arcname = f.name
+                        if arcname in existing_members:
+                            log.debug("session_archive_job: %s already in archive — skipping", arcname)
+                            continue
+                        tar.add(str(f), arcname=arcname)
+                        added += 1
+
+                # Atomically replace the archive
+                shutil.move(str(tmp_path), str(archive_path))
+
+                # Delete originals now that archive is safely written
+                deleted = 0
+                for f in files:
+                    try:
+                        f.unlink()
+                        deleted += 1
+                    except OSError as exc:
+                        log.warning("session_archive_job: failed to delete %s: %s", f, exc)
+
+                total_archived += added
+                total_deleted += deleted
+                months_processed += 1
+                log.info(
+                    "session_archive_job: %s — archived %d files, deleted %d originals",
+                    archive_name, added, deleted,
+                )
+
+            except Exception as exc:
+                log.exception("session_archive_job: failed to create archive %s: %s", archive_name, exc)
+                # Clean up temp file if it exists
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        detail = (
+            f"months={months_processed} "
+            f"archived={total_archived} "
+            f"deleted={total_deleted}"
+        )
+        log.info("session_archive_job: complete in %dms — %s", duration_ms, detail)
+        await _audit_end("session_archive", duration_ms, detail)
+
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.exception("session_archive_job: unhandled error after %dms: %s", duration_ms, exc)
+        await _audit_end("session_archive", duration_ms, f"error={exc!r}")
+
+
+def _extract_month_key(path: Path) -> str:
+    """
+    Extract a YYYY-MM month key from a session log file.
+
+    Tries to parse from the filename first (expecting YYYY-MM-DD prefix),
+    falls back to the file's modification time.
+    """
+    name = path.stem  # e.g. "2026-01-15" or "2026-01-15_extra"
+    try:
+        # Try parsing the first 10 chars as a date
+        dt = datetime.strptime(name[:10], "%Y-%m-%d")
+        return dt.strftime("%Y-%m")
+    except (ValueError, IndexError):
+        pass
+    # Fall back to mtime
+    mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    return mtime.strftime("%Y-%m")
+
+
+# ── Job: nightly backup ──────────────────────────────────────────────────────
+
+
+@_with_retry(max_retries=1, backoff_base=5.0)
+async def _nightly_backup_job() -> None:
+    """
+    Daily at 04:00 (dream mode) — back up databases, ChromaDB, and config.
+
+    NOT wake-gated: runs during dream mode to avoid I/O contention.
+    Retains last 7 backups; older ones are pruned automatically.
+    """
+    t0 = time.monotonic()
+    await _audit_start("nightly_backup")
+    log.info("nightly_backup_job: starting")
+
+    try:
+        from app.utils.backup import run_backup
+        summary = run_backup()
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.info(
+            "nightly_backup_job: complete in %dms — %d items, %d errors, %d pruned",
+            duration_ms, len(summary["copied"]), len(summary["errors"]), summary["pruned"],
+        )
+        await _audit_end(
+            "nightly_backup", duration_ms,
+            f"copied={len(summary['copied'])} errors={len(summary['errors'])} "
+            f"pruned={summary['pruned']}",
+        )
+    except Exception as exc:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        log.exception("nightly_backup_job: error after %dms: %s", duration_ms, exc)
+        await _audit_end("nightly_backup", duration_ms, f"error={exc!r}")
+
+
+# ── Job: weekly database maintenance ─────────────────────────────────────────
+
+
+@_with_retry()
+async def _db_maintenance_job() -> None:
+    """
+    Weekly (Sunday 02:00) — VACUUM, ANALYZE, integrity check on all SQLite databases.
+    Logs sizes and alerts if any exceed 500 MB.
+    """
+    import sqlite3
+    t0 = time.monotonic()
+    await _audit_start("db_maintenance")
+    log.info("db_maintenance_job: starting")
+
+    db_dir = Path(settings.audit_log_path).parent
+    db_files = sorted(db_dir.glob("*.db"))
+    results = []
+
+    for db_file in db_files:
+        name = db_file.name
+        size_mb = db_file.stat().st_size / (1024 * 1024)
+        try:
+            conn = sqlite3.connect(str(db_file))
+            # Integrity check
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            # VACUUM and ANALYZE
+            conn.execute("VACUUM")
+            conn.execute("ANALYZE")
+            conn.close()
+
+            new_size_mb = db_file.stat().st_size / (1024 * 1024)
+            status = "ok" if integrity == "ok" else f"INTEGRITY_FAIL: {integrity}"
+            results.append(f"{name}: {size_mb:.1f}MB→{new_size_mb:.1f}MB ({status})")
+
+            if new_size_mb > 500:
+                log.warning("db_maintenance: %s exceeds 500MB (%.1fMB)", name, new_size_mb)
+        except Exception as exc:
+            results.append(f"{name}: error — {exc}")
+            log.error("db_maintenance: %s failed: %s", name, exc)
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    summary = "; ".join(results)
+    log.info("db_maintenance_job: done in %dms — %s", duration_ms, summary)
+    await _audit_end("db_maintenance", duration_ms, summary)
+
+
+# ── Job: disk space monitoring (added to overdue_check) ──────────────────────
+
+
+@_with_retry()
+async def _disk_monitor_job() -> None:
+    """
+    Daily at 08:35 — check available disk space on the Pi.
+    Posts warnings to the noticeboard if space is low.
+    """
+    import shutil
+    t0 = time.monotonic()
+    await _audit_start("disk_monitor")
+
+    total, used, free = shutil.disk_usage("/")
+    free_gb = free / (1024 ** 3)
+    total_gb = total / (1024 ** 3)
+    pct_used = (used / total) * 100
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+
+    if free_gb < 0.5:
+        msg = (
+            f"🚨 **CRITICAL: Disk space critically low** — "
+            f"{free_gb:.1f} GB free of {total_gb:.1f} GB ({pct_used:.0f}% used). "
+            f"Immediate action required to prevent data loss."
+        )
+        log.critical("disk_monitor: CRITICAL — %.1f GB free", free_gb)
+        await _notify(msg)
+    elif free_gb < 1.0:
+        msg = (
+            f"⚠️ **Warning: Disk space running low** — "
+            f"{free_gb:.1f} GB free of {total_gb:.1f} GB ({pct_used:.0f}% used). "
+            f"Consider cleaning up old backups or logs."
+        )
+        log.warning("disk_monitor: LOW — %.1f GB free", free_gb)
+        await _notify(msg)
+    else:
+        log.info("disk_monitor: %.1f GB free (%.0f%% used)", free_gb, pct_used)
+
+    await _audit_end("disk_monitor", duration_ms, f"free={free_gb:.1f}GB used={pct_used:.0f}%")
+
+
+# ── Job: backup verification ─────────────────────────────────────────────────
+
+
+@_with_retry()
+async def _backup_verify_job() -> None:
+    """
+    Daily at 05:00 — verify nightly backup was created and is valid.
+    Tests restoring to temp location and runs integrity check.
+    Manages retention: 7 daily, 4 weekly (Sun), 3 monthly (1st).
+    """
+    import sqlite3
+    import shutil
+    import tempfile
+    t0 = time.monotonic()
+    await _audit_start("backup_verify")
+    log.info("backup_verify_job: starting")
+
+    backup_dir = Path(settings.backup_path)
+    if not backup_dir.exists():
+        await _audit_end("backup_verify", 0, "error=backup_dir_missing")
+        return
+
+    # Find today's backup
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    backups = sorted(backup_dir.iterdir(), reverse=True) if backup_dir.exists() else []
+    today_backup = None
+    for b in backups:
+        if b.is_dir() and today_str in b.name:
+            today_backup = b
+            break
+
+    if not today_backup:
+        log.warning("backup_verify: no backup found for %s", today_str)
+        await _audit_end("backup_verify", int((time.monotonic() - t0) * 1000), "error=no_backup_today")
+        return
+
+    # Verify backup is non-empty
+    db_files = list(today_backup.glob("*.db"))
+    if not db_files:
+        log.warning("backup_verify: backup %s contains no .db files", today_backup.name)
+        await _audit_end("backup_verify", int((time.monotonic() - t0) * 1000), "error=empty_backup")
+        return
+
+    # Test integrity on a copy
+    errors = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for db_file in db_files:
+            try:
+                test_path = Path(tmpdir) / db_file.name
+                shutil.copy2(db_file, test_path)
+                conn = sqlite3.connect(str(test_path))
+                result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+                conn.close()
+                if result != "ok":
+                    errors.append(f"{db_file.name}: integrity={result}")
+            except Exception as exc:
+                errors.append(f"{db_file.name}: {exc}")
+
+    # Calculate backup size
+    backup_size = sum(f.stat().st_size for f in today_backup.rglob("*") if f.is_file())
+    backup_mb = backup_size / (1024 * 1024)
+
+    # ── Retention policy: 7 daily, 4 weekly (Sun), 3 monthly (1st) ──
+    all_backups = sorted(
+        [d for d in backup_dir.iterdir() if d.is_dir()],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    keep = set()
+    daily_count = weekly_count = monthly_count = 0
+    for b in all_backups:
+        # Parse date from backup name (expects YYYY-MM-DD somewhere in name)
+        import re
+        date_match = re.search(r"(\d{4})-(\d{2})-(\d{2})", b.name)
+        if not date_match:
+            continue
+        year, month, day = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
+        try:
+            backup_date = datetime(year, month, day)
+        except ValueError:
+            continue
+
+        is_sunday = backup_date.weekday() == 6
+        is_first = day == 1
+
+        if daily_count < 7:
+            keep.add(b)
+            daily_count += 1
+        if is_sunday and weekly_count < 4:
+            keep.add(b)
+            weekly_count += 1
+        if is_first and monthly_count < 3:
+            keep.add(b)
+            monthly_count += 1
+
+    pruned = 0
+    for b in all_backups:
+        if b not in keep:
+            try:
+                shutil.rmtree(b)
+                pruned += 1
+            except Exception as exc:
+                log.warning("backup_verify: failed to prune %s: %s", b.name, exc)
+
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    status = "ok" if not errors else f"errors={len(errors)}"
+    log.info(
+        "backup_verify_job: %s in %dms — size=%.1fMB files=%d pruned=%d",
+        status, duration_ms, backup_mb, len(db_files), pruned,
+    )
+    await _audit_end(
+        "backup_verify", duration_ms,
+        f"{status} size={backup_mb:.1f}MB files={len(db_files)} pruned={pruned}",
+    )

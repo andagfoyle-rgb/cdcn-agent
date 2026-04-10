@@ -1,0 +1,915 @@
+"""
+Web interface — multi-user chat room with registration, admin panel, polls.
+"""
+from __future__ import annotations
+import asyncio, json, logging, sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+import aiosqlite
+from fastapi import APIRouter, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from app.auth.auth import (
+    ALGORITHM, authenticate_user, create_access_token, verify_token,
+    register_user, get_pending_registrations, approve_registration,
+    reject_registration, list_users, update_user_role, suspend_user,
+    reactivate_user, has_permission,
+)
+from app.config import settings
+from app.interfaces.base_adapter import BaseAdapter
+log = logging.getLogger(__name__)
+web_router = APIRouter()
+_active_ws: dict[str, WebSocket] = {}
+_user_display: dict[str, str] = {}
+_user_roles: dict[str, str] = {}
+def _audit_db(): return settings.audit_log_path
+def _user_db(): return str(Path(settings.audit_log_path).parent / "users.db")
+def _get_user_from_cookie(r):
+    t = r.cookies.get("access_token")
+    return verify_token(t) if t else None
+
+async def _save_message(username, display_name, role, msg_type, content):
+    ts = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(_audit_db()) as conn:
+        await conn.execute(
+            "INSERT INTO shared_messages (ts, username, display_name, role, msg_type, content)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (ts, username, display_name, role, msg_type, content),
+        )
+        await conn.commit()
+
+async def _get_history(limit=100):
+    async with aiosqlite.connect(_audit_db()) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT * FROM shared_messages ORDER BY id DESC LIMIT ?", (limit,)
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+async def _broadcast(msg):
+    dead = []
+    for username, ws in list(_active_ws.items()):
+        try:
+            await ws.send_text(json.dumps(msg))
+        except Exception:
+            dead.append(username)
+    for u in dead:
+        _active_ws.pop(u, None)
+        _user_display.pop(u, None)
+        _user_roles.pop(u, None)
+
+async def _broadcast_system(content, save=True):
+    if save:
+        await _save_message("system", "System", "system", "system", content)
+    await _broadcast({"type": "system", "content": content})
+
+async def _broadcast_user_msg(username, display_name, role, content):
+    await _save_message(username, display_name, role, "user", content)
+    await _broadcast({
+        "type": "user_message", "username": username,
+        "display_name": display_name, "role": role, "content": content,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+
+async def _broadcast_online():
+    users = [
+        {"username": u, "display_name": _user_display.get(u, u), "role": _user_roles.get(u, "")}
+        for u in _active_ws
+    ]
+    await _broadcast({"type": "online_users", "users": users})
+
+async def _get_open_polls():
+    async with aiosqlite.connect(_audit_db()) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT p.*, (SELECT COUNT(*) FROM poll_responses WHERE poll_id = p.id) as response_count"
+            " FROM polls p WHERE p.status = 'open' ORDER BY p.id DESC"
+        ) as cur:
+            polls = [dict(r) for r in await cur.fetchall()]
+        for poll in polls:
+            poll["options"] = json.loads(poll["options"])
+            async with conn.execute(
+                "SELECT response, COUNT(*) as count FROM poll_responses"
+                " WHERE poll_id = ? GROUP BY response", (poll["id"],),
+            ) as cur:
+                results = await cur.fetchall()
+            poll["results"] = {r["response"]: r["count"] for r in results}
+    return polls
+
+_CSS = """
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       background: #f0f2f5; height: 100vh; display: flex; flex-direction: column; }
+.header { background: #1F5C8B; color: white; padding: .75rem 1.25rem;
+          display: flex; align-items: center; gap: 1rem; flex-shrink: 0; }
+.header h1 { font-size: 1.1rem; font-weight: 600; flex: 1; }
+.status-badge { font-size: .75rem; padding: .2rem .6rem; border-radius: 12px;
+                background: rgba(255,255,255,.2); }
+.status-badge.wake { background: #22c55e; }
+.status-badge.dream { background: #6366f1; }
+.online-users { font-size: .8rem; opacity: .85; }
+.header-actions a { color: rgba(255,255,255,.8); text-decoration: none;
+                    font-size: .85rem; padding: .3rem .7rem; border-radius: 4px;
+                    border: 1px solid rgba(255,255,255,.3); margin-left: .5rem; }
+.header-actions a:hover { background: rgba(255,255,255,.15); }
+.main { display: flex; flex: 1; overflow: hidden; }
+.messages-wrap { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.messages { flex: 1; overflow-y: auto; padding: 1rem; display: flex;
+            flex-direction: column; gap: .75rem; }
+.msg { max-width: 85%; display: flex; flex-direction: column; gap: .2rem; }
+.msg.agent { align-self: flex-start; }
+.msg.user-me { align-self: flex-end; }
+.msg.user-other { align-self: flex-start; }
+.msg.system-msg { align-self: center; max-width: 100%; }
+.msg-meta { font-size: .72rem; color: #888; display: flex; gap: .5rem; align-items: center; }
+.msg.user-me .msg-meta { justify-content: flex-end; }
+.role-badge { font-size: .65rem; padding: .1rem .4rem; border-radius: 8px;
+              background: #e5e7eb; color: #555; }
+.role-badge.admin { background: #fef3c7; color: #92400e; }
+.role-badge.staff { background: #dbeafe; color: #1e40af; }
+.msg-bubble { padding: .6rem .9rem; border-radius: 12px; line-height: 1.5;
+              white-space: pre-wrap; word-break: break-word; }
+.msg.agent .msg-bubble { background: white; border: 1px solid #e0e0e0;
+                          border-bottom-left-radius: 3px; }
+.msg.user-me .msg-bubble { background: #2E75B6; color: white;
+                             border-bottom-right-radius: 3px; }
+.msg.user-other .msg-bubble { background: white; border: 1px solid #e0e0e0;
+                                border-bottom-left-radius: 3px; }
+.msg.system-msg .msg-bubble { background: transparent; color: #888;
+                                font-size: .8rem; font-style: italic;
+                                border: none; text-align: center; }
+.typing { color: #888; font-style: italic; font-size: .85rem; padding: .5rem 1rem; }
+.input-area { padding: .75rem 1rem; background: white; border-top: 1px solid #e0e0e0;
+              display: flex; gap: .5rem; align-items: flex-end; flex-shrink: 0; }
+.input-area textarea { flex: 1; padding: .6rem .8rem; border: 1px solid #ccc;
+                        border-radius: 8px; resize: none; font-size: .95rem;
+                        font-family: inherit; max-height: 150px; }
+.input-area textarea:focus { outline: none; border-color: #2E75B6; }
+.btn { padding: .6rem 1.1rem; border: none; border-radius: 8px; cursor: pointer;
+       font-size: .9rem; font-weight: 500; transition: background .15s; }
+.btn-primary { background: #2E75B6; color: white; }
+.btn-primary:hover { background: #1F5C8B; }
+.btn-primary:disabled { background: #ccc; cursor: not-allowed; }
+.btn-secondary { background: #f1f3f4; color: #333; border: 1px solid #ccc; }
+.btn-icon { background: #f1f3f4; border: 1px solid #ccc; border-radius: 8px;
+            padding: .6rem .8rem; cursor: pointer; font-size: 1.1rem; line-height: 1; }
+.btn-icon:hover { background: #e2e5e9; }
+#upload-input { display: none; }
+.drag-overlay { display: none; position: fixed; inset: 0; background: rgba(46,117,182,.15);
+                border: 3px dashed #2E75B6; z-index: 100; align-items: center;
+                justify-content: center; font-size: 1.5rem; color: #1F5C8B;
+                font-weight: 600; pointer-events: none; }
+.drag-overlay.active { display: flex; }
+.poll-widget { background: white; border: 1px solid #e0e0e0; border-radius: 12px;
+               padding: 1rem; max-width: 500px; width: 100%; }
+.poll-question { font-weight: 600; margin-bottom: .75rem; }
+.poll-option { display: flex; align-items: center; gap: .6rem; margin-bottom: .5rem;
+               padding: .5rem .75rem; border: 1px solid #e0e0e0; border-radius: 8px;
+               cursor: pointer; }
+.poll-option:hover { background: #f0f7ff; }
+.poll-option input { cursor: pointer; }
+.poll-bar { flex: 1; height: 6px; background: #e5e7eb; border-radius: 3px;
+            overflow: hidden; margin-left: auto; width: 80px; }
+.poll-bar-fill { height: 100%; background: #2E75B6; border-radius: 3px; }
+.poll-count { font-size: .75rem; color: #888; min-width: 30px; text-align: right; }
+.poll-type-badge { font-size: .7rem; color: #888; margin-bottom: .5rem; }
+.auth-page { min-height: 100vh; display: flex; align-items: center;
+             justify-content: center; background: #f0f2f5; }
+.auth-box { background: white; padding: 2.5rem; border-radius: 12px;
+            box-shadow: 0 2px 12px rgba(0,0,0,.1); width: 100%; max-width: 420px; }
+.auth-box h1 { color: #1F5C8B; margin-bottom: 1.5rem; font-size: 1.4rem; }
+.form-group { margin-bottom: 1rem; }
+.form-group label { display: block; font-size: .85rem; font-weight: 500;
+                    color: #444; margin-bottom: .3rem; }
+.form-group input, .form-group select, .form-group textarea {
+    width: 100%; padding: .6rem .8rem; border: 1px solid #ccc; border-radius: 6px;
+    font-size: .95rem; font-family: inherit; }
+.form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+    outline: none; border-color: #2E75B6; }
+.form-actions { margin-top: 1.5rem; }
+.form-actions .btn { width: 100%; padding: .75rem; font-size: 1rem; }
+.auth-link { text-align: center; margin-top: 1rem; font-size: .85rem; color: #666; }
+.auth-link a { color: #2E75B6; text-decoration: none; }
+.error { color: #dc2626; font-size: .85rem; margin-bottom: 1rem;
+         padding: .5rem .75rem; background: #fef2f2; border-radius: 6px; }
+.success { color: #16a34a; font-size: .85rem; margin-bottom: 1rem;
+           padding: .5rem .75rem; background: #f0fdf4; border-radius: 6px; }
+.admin-page { max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+.admin-page h1 { color: #1F5C8B; margin-bottom: 1.5rem; }
+.admin-section { background: white; border-radius: 10px; padding: 1.5rem;
+                 margin-bottom: 1.5rem; border: 1px solid #e0e0e0; }
+.admin-section h2 { font-size: 1rem; color: #333; margin-bottom: 1rem;
+                    padding-bottom: .5rem; border-bottom: 1px solid #e0e0e0; }
+.user-table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+.user-table th { text-align: left; padding: .5rem .75rem; background: #f8fafc;
+                  color: #555; font-weight: 600; border-bottom: 1px solid #e0e0e0; }
+.user-table td { padding: .5rem .75rem; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
+.user-table tr:last-child td { border-bottom: none; }
+.badge { font-size: .72rem; padding: .2rem .5rem; border-radius: 10px; }
+.badge-pending { background: #fef3c7; color: #92400e; }
+.badge-active { background: #dcfce7; color: #166534; }
+.badge-suspended { background: #fee2e2; color: #991b1b; }
+.action-btns { display: flex; gap: .4rem; flex-wrap: wrap; }
+.btn-sm { padding: .3rem .65rem; font-size: .78rem; border-radius: 5px; border: none; cursor: pointer; }
+.btn-approve { background: #22c55e; color: white; }
+.btn-reject { background: #ef4444; color: white; }
+.btn-suspend { background: #f59e0b; color: white; }
+.btn-reactivate { background: #3b82f6; color: white; }
+.back-link { display: inline-block; color: #2E75B6; text-decoration: none;
+             font-size: .9rem; margin-bottom: 1rem; }
+"""
+
+_JS = r"""
+(function () {
+'use strict';
+var wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
+var ws = null;
+var currentUsername = document.body.dataset.username;
+var currentDisplay = document.body.dataset.display;
+var currentRole = document.body.dataset.role;
+var agentEl = null;
+var shownIds = new Set();
+var agentContent = '';
+var messages = document.getElementById('messages');
+var input = document.getElementById('input');
+var sendBtn = document.getElementById('send-btn');
+var uploadInput = document.getElementById('upload-input');
+var typingEl = document.getElementById('typing-indicator');
+
+function ts() {
+  return new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+function escHtml(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function roleBadge(role) {
+  var cls = role === 'admin' ? 'admin' : (role === 'staff' ? 'staff' : '');
+  return '<span class="role-badge ' + cls + '">' + escHtml(role) + '</span>';
+}
+function appendMsg(type, displayName, role, content, isMe) {
+  var div = document.createElement('div');
+  if (type === 'system') {
+    div.className = 'msg system-msg';
+    div.innerHTML = '<div class="msg-bubble">' + escHtml(content) + '</div>';
+  } else {
+    div.className = 'msg ' + (type === 'agent' ? 'agent' : (isMe ? 'user-me' : 'user-other'));
+    var meta = '<div class="msg-meta">' +
+      (isMe ? '' : '<strong>' + escHtml(displayName) + '</strong>' + roleBadge(role)) +
+      '<span>' + ts() + '</span>' +
+      (isMe ? roleBadge(role) : '') +
+      '</div>';
+    div.innerHTML = meta + '<div class="msg-bubble">' + escHtml(content) + '</div>';
+  }
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+  return div;
+}
+function appendHistoryMsg(msg) {
+  if (msg.id && shownIds.has(msg.id)) return;
+  if (msg.id) shownIds.add(msg.id);
+  var isMe = msg.username === currentUsername;
+  var type = msg.msg_type;
+  var displayName = msg.display_name || msg.username;
+  var div = document.createElement('div');
+  if (type === 'system') {
+    div.className = 'msg system-msg';
+    div.innerHTML = '<div class="msg-bubble">' + escHtml(msg.content) + '</div>';
+  } else {
+    div.className = 'msg ' + (type === 'agent' ? 'agent' : (isMe ? 'user-me' : 'user-other'));
+    var tstr = new Date(msg.ts).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    var meta = '<div class="msg-meta">' +
+      (isMe ? '' : '<strong>' + escHtml(displayName) + '</strong>' + roleBadge(msg.role)) +
+      '<span>' + tstr + '</span>' +
+      (isMe ? roleBadge(msg.role) : '') +
+      '</div>';
+    div.innerHTML = meta + '<div class="msg-bubble">' + escHtml(msg.content) + '</div>';
+  }
+  messages.appendChild(div);
+}
+function updateOnlineUsers(users) {
+  var el = document.getElementById('online-users');
+  if (!el) return;
+  var names = users.map(function(u) { return escHtml(u.display_name || u.username); });
+  el.innerHTML = 'Online: ' + (names.length ? names.join(', ') : 'just you');
+}
+function renderPoll(pollData) {
+  var div = document.createElement('div');
+  div.className = 'msg agent';
+  div.innerHTML = '<div class="msg-meta"><strong>CDCN Agent</strong><span>' + ts() + '</span></div>';
+  var widget = document.createElement('div');
+  widget.className = 'poll-widget';
+  widget.dataset.pollId = pollData.id;
+  widget.dataset.pollType = pollData.poll_type;
+  var typeLabel = pollData.poll_type === 'multi_select' ? 'Select all that apply' : 'Select one';
+  var totalVotes = pollData.response_count || 0;
+  var html = '<div class="poll-type-badge">' + typeLabel + '</div>';
+  html += '<div class="poll-question">' + escHtml(pollData.question) + '</div>';
+  pollData.options.forEach(function(opt) {
+    var count = (pollData.results && pollData.results[opt]) || 0;
+    var pct = totalVotes > 0 ? Math.round(count / totalVotes * 100) : 0;
+    var inputType = pollData.poll_type === 'multi_select' ? 'checkbox' : 'radio';
+    html += '<label class="poll-option">' +
+      '<input type="' + inputType + '" name="poll_' + pollData.id + '" value="' + escHtml(opt) + '">' +
+      '<span>' + escHtml(opt) + '</span>' +
+      '<div class="poll-bar"><div class="poll-bar-fill" style="width:' + pct + '%"></div></div>' +
+      '<span class="poll-count">' + count + '</span></label>';
+  });
+  html += '<div style="margin-top:.75rem"><button class="btn btn-primary btn-sm" onclick="submitPoll(' + pollData.id + ')">Submit</button></div>';
+  widget.innerHTML = html;
+  div.appendChild(widget);
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+}
+window.submitPoll = function(pollId) {
+  var widget = document.querySelector('[data-poll-id="' + pollId + '"]');
+  var inputs = widget.querySelectorAll('input:checked');
+  var responses = Array.from(inputs).map(function(i) { return i.value; });
+  if (!responses.length) { alert('Please select an option.'); return; }
+  fetch('/api/polls/' + pollId + '/vote', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({responses: responses})
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (data.success) {
+      widget.querySelector('[style*="margin-top"]').innerHTML = '<em style="color:#16a34a">Vote recorded \u2714</em>';
+    }
+  });
+};
+function connectWS() {
+  ws = new WebSocket(wsUrl);
+  var pingInterval = null;
+  ws.onopen = function() {
+    setInputEnabled(true);
+    if (pingInterval) clearInterval(pingInterval);
+    pingInterval = setInterval(function() {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ping: true}));
+    }, 15000);
+    fetch('/api/history').then(function(r) { return r.json(); }).then(function(data) {
+      data.forEach(appendHistoryMsg);
+      messages.scrollTop = messages.scrollHeight;
+    });
+    fetch('/api/polls').then(function(r) { return r.json(); }).then(function(polls) {
+      polls.forEach(renderPoll);
+    });
+  };
+  ws.onclose = function() {
+    setInputEnabled(false);
+    if (pingInterval) { clearInterval(pingInterval); pingInterval = null; }
+    setTimeout(connectWS, 3000);
+  };
+  ws.onerror = function() { ws.close(); };
+  ws.onmessage = function(event) {
+    var data = JSON.parse(event.data);
+    if (data.type === 'token') {
+      if (!agentEl) {
+        agentEl = document.createElement('div');
+        agentEl.className = 'msg agent';
+        agentEl.innerHTML = '<div class="msg-meta"><strong>CDCN Agent</strong><span>' + ts() + '</span></div><div class="msg-bubble"></div>';
+        messages.appendChild(agentEl);
+        agentContent = '';
+        typingEl.style.display = 'none';
+      }
+      agentContent += data.content;
+      agentEl.querySelector('.msg-bubble').textContent = agentContent;
+      messages.scrollTop = messages.scrollHeight;
+    } else if (data.type === 'done') {
+      if (agentEl && agentContent) {
+        var finalContent = agentContent;
+        agentEl = null; agentContent = '';
+        fetch('/api/save_agent_message', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({content: finalContent})
+        });
+      }
+      setInputEnabled(true);
+      typingEl.style.display = 'none';
+    } else if (data.type === 'user_message') {
+      if (data.username !== currentUsername) {
+        appendMsg('user', data.display_name || data.username, data.role, data.content, false);
+      }
+    } else if (data.type === 'system') {
+      appendMsg('system', '', '', data.content);
+    } else if (data.type === 'online_users') {
+      updateOnlineUsers(data.users);
+    } else if (data.type === 'poll') {
+      renderPoll(data.poll);
+    } else if (data.type === 'error') {
+      appendMsg('system', '', '', 'Error: ' + (data.detail || 'unknown'));
+      setInputEnabled(true);
+      typingEl.style.display = 'none';
+    }
+  };
+}
+connectWS();
+
+function setInputEnabled(enabled) {
+  input.disabled = !enabled;
+  sendBtn.disabled = !enabled;
+  if (enabled) input.focus();
+}
+
+function sendMessage() {
+  var text = input.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  appendMsg('user', currentDisplay, currentRole, text, true);
+  ws.send(JSON.stringify({message: text}));
+  input.value = '';
+  setInputEnabled(false);
+  typingEl.style.display = 'block';
+  typingEl.textContent = 'CDCN Agent is thinking…';
+  agentEl = null; agentContent = '';
+}
+
+sendBtn.addEventListener('click', sendMessage);
+input.addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+uploadInput.addEventListener('change', function() {
+  if (!uploadInput.files.length) return;
+  uploadFiles(uploadInput.files);
+  uploadInput.value = '';
+});
+
+function uploadFiles(files) {
+  var fd = new FormData();
+  var names = [];
+  Array.from(files).forEach(function(f) { fd.append('files', f); names.push(f.name); });
+  appendMsg('system', '', '', 'Uploading: ' + names.join(', ') + '...');
+  fetch('/upload', {method: 'POST', body: fd})
+    .then(function(r) { return r.json(); })
+    .then(function(data) { appendMsg('system', '', '', data.message || 'Upload complete.'); })
+    .catch(function() { appendMsg('system', '', '', 'Upload failed.'); });
+}
+
+var dragOverlay = document.getElementById('drag-overlay');
+var dragCount = 0;
+document.addEventListener('dragenter', function(e) {
+  e.preventDefault(); dragCount++; dragOverlay.classList.add('active');
+});
+document.addEventListener('dragleave', function() {
+  dragCount--;
+  if (dragCount <= 0) { dragCount = 0; dragOverlay.classList.remove('active'); }
+});
+document.addEventListener('dragover', function(e) { e.preventDefault(); });
+document.addEventListener('drop', function(e) {
+  e.preventDefault(); dragCount = 0; dragOverlay.classList.remove('active');
+  if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+});
+
+function pollStatus() {
+  fetch('/api/status').then(function(r) { return r.json(); }).then(function(s) {
+    var badge = document.getElementById('status-badge');
+    if (badge) {
+      var mode = (s.mode || 'unknown').replace(/_/g, '-');
+      badge.textContent = mode;
+      badge.className = 'status-badge ' + (s.mode || 'unknown');
+    }
+  }).catch(function(){});
+}
+pollStatus();
+setInterval(pollStatus, 30000);
+}());
+"""
+
+def _login_html(error=""):
+    err = f'<div class="error">{error}</div>' if error else ""
+    return f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CDCN Agent</title><style>{_CSS}</style></head>
+<body><div class="auth-page"><div class="auth-box">
+<h1>CDCN Agent</h1>{err}
+<form method="post" action="/login">
+<div class="form-group"><label>Username</label>
+<input type="text" name="username" required autofocus></div>
+<div class="form-group"><label>Password</label>
+<input type="password" name="password" required></div>
+<div class="form-actions"><button type="submit" class="btn btn-primary">Sign in</button></div>
+</form>
+<div class="auth-link"><a href="/register">Request access</a></div>
+</div></div></body></html>"""
+
+def _register_html(error="", success=""):
+    err = f'<div class="error">{error}</div>' if error else ""
+    suc = f'<div class="success">{success}</div>' if success else ""
+    return f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CDCN Agent — Request Access</title><style>{_CSS}</style></head>
+<body><div class="auth-page"><div class="auth-box">
+<h1>Request Access</h1>{err}{suc}
+<form method="post" action="/register">
+<div class="form-group"><label>Full name</label>
+<input type="text" name="display_name" required></div>
+<div class="form-group"><label>Email</label>
+<input type="email" name="email" required></div>
+<div class="form-group"><label>Username</label>
+<input type="text" name="username" required></div>
+<div class="form-group"><label>Password</label>
+<input type="password" name="password" required></div>
+<div class="form-group"><label>Reason for access</label>
+<textarea name="reason" rows="3" placeholder="Please explain your role with CDCN..."></textarea></div>
+<div class="form-actions"><button type="submit" class="btn btn-primary">Submit request</button></div>
+</form>
+<div class="auth-link"><a href="/login">Back to login</a></div>
+</div></div></body></html>"""
+
+def _chat_html(username, display_name, role, is_admin):
+    admin_link = '<a href="/admin">Admin</a>' if is_admin else ""
+    return f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CDCN Agent</title><style>{_CSS}</style></head>
+<body data-username="{username}" data-display="{display_name}" data-role="{role}">
+<div class="drag-overlay" id="drag-overlay">&#128194; Drop files to upload</div>
+<div class="header">
+  <h1>CDCN Agent</h1>
+  <span class="status-badge" id="status-badge">&#8230;</span>
+  <span class="online-users" id="online-users"></span>
+  <div class="header-actions">{admin_link}<a href="/logout">Sign out ({display_name})</a></div>
+</div>
+<div class="main"><div class="messages-wrap">
+  <div class="messages" id="messages"></div>
+  <div class="typing" id="typing-indicator" style="display:none"></div>
+  <div class="input-area">
+    <textarea id="input" rows="2" placeholder="Message CDCN Agent&#8230; (Enter to send, Shift+Enter for new line)" disabled></textarea>
+    <label class="btn-icon" title="Upload document">&#128206;
+      <input type="file" id="upload-input" accept=".pdf,.docx,.txt,.md" multiple>
+    </label>
+    <button class="btn btn-primary" id="send-btn" disabled>Send</button>
+  </div>
+</div></div>
+<script>{_JS}</script></body></html>"""
+
+def _admin_html(pending, users, current_user):
+    pending_rows = ""
+    for r in pending:
+        pending_rows += f"""<tr>
+<td>{r['display_name']}</td><td>{r['username']}</td><td>{r['email']}</td>
+<td>{r.get('reason','')}</td><td>{r['created_at'][:10]}</td>
+<td class="action-btns">
+<form method="post" action="/admin/approve" style="display:inline">
+<input type="hidden" name="request_id" value="{r['id']}">
+<select name="role"><option value="staff">Staff</option><option value="admin">Admin</option><option value="trustee">Observer</option></select>
+<button type="submit" class="btn btn-sm btn-approve">Approve</button></form>
+<form method="post" action="/admin/reject" style="display:inline">
+<input type="hidden" name="request_id" value="{r['id']}">
+<input type="text" name="reason" placeholder="Reason (optional)" style="width:120px;font-size:.8rem;padding:.2rem .4rem;border:1px solid #ccc;border-radius:4px">
+<button type="submit" class="btn btn-sm btn-reject">Reject</button></form>
+</td></tr>"""
+    user_rows = ""
+    for u in users:
+        if u['username'] == current_user:
+            continue
+        status = u.get('status', 'active') or ('active' if u.get('active', 1) else 'suspended')
+        status_badge = f'<span class="badge badge-{status}">{status}</span>'
+        actions = ""
+        if u.get('active', 1):
+            actions += f'<form method="post" action="/admin/suspend" style="display:inline"><input type="hidden" name="username" value="{u["username"]}"><button type="submit" class="btn btn-sm btn-suspend">Suspend</button></form>'
+            actions += f'<form method="post" action="/admin/role" style="display:inline"><input type="hidden" name="username" value="{u["username"]}"><select name="role"><option value="staff">Staff</option><option value="admin">Admin</option><option value="trustee">Observer</option></select><button type="submit" class="btn btn-sm btn-reactivate">Set role</button></form>'
+        else:
+            actions += f'<form method="post" action="/admin/reactivate" style="display:inline"><input type="hidden" name="username" value="{u["username"]}"><button type="submit" class="btn btn-sm btn-reactivate">Reactivate</button></form>'
+        user_rows += f"<tr><td>{u.get('display_name') or u['username']}</td><td>{u['username']}</td><td>{u['role']}</td><td>{status_badge}</td><td class='action-btns'>{actions}</td></tr>"
+    no_pending = '<p style="color:#888;font-size:.9rem">No pending requests.</p>'
+    pending_table = f'<table class="user-table"><thead><tr><th>Name</th><th>Username</th><th>Email</th><th>Reason</th><th>Date</th><th>Actions</th></tr></thead><tbody>{pending_rows}</tbody></table>' if pending else no_pending
+    return f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CDCN Agent — Admin</title><style>{_CSS}</style></head>
+<body><div class="admin-page">
+<a href="/" class="back-link">&#8592; Back to chat</a>
+<h1>Admin Panel</h1>
+<div class="admin-section"><h2>Pending Registrations ({len(pending)})</h2>{pending_table}</div>
+<div class="admin-section"><h2>Users</h2>
+<table class="user-table"><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
+<tbody>{user_rows}</tbody></table></div>
+</div></body></html>"""
+
+@web_router.get("/login", response_class=HTMLResponse)
+async def login_form():
+    return HTMLResponse(_login_html())
+
+@web_router.post("/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    username = str(form.get("username", "")).strip()
+    password = str(form.get("password", ""))
+    user = authenticate_user(username, password)
+    if not user:
+        return HTMLResponse(_login_html(error="Invalid username or password."), status_code=401)
+    token = create_access_token(user)
+    resp = RedirectResponse(url="/", status_code=303)
+    resp.set_cookie(key="access_token", value=token, httponly=True, samesite="lax", max_age=28800)
+    return resp
+
+@web_router.get("/logout")
+async def logout():
+    resp = RedirectResponse(url="/login", status_code=303)
+    resp.delete_cookie("access_token")
+    return resp
+
+@web_router.get("/register", response_class=HTMLResponse)
+async def register_form():
+    return HTMLResponse(_register_html())
+
+@web_router.post("/register")
+async def register_submit(request: Request):
+    form = await request.form()
+    username = str(form.get("username", "")).strip()
+    password = str(form.get("password", ""))
+    display_name = str(form.get("display_name", "")).strip()
+    email = str(form.get("email", "")).strip()
+    reason = str(form.get("reason", "")).strip()
+    if not all([username, password, display_name, email]):
+        return HTMLResponse(_register_html(error="All fields are required."))
+    try:
+        register_user(username, password, display_name, email, "staff", reason)
+        await _broadcast_system(f"New registration request from {display_name} — review in Admin Panel.")
+        return HTMLResponse(_register_html(success="Your request has been submitted. An administrator will review it shortly."))
+    except ValueError as e:
+        return HTMLResponse(_register_html(error=str(e)))
+
+@web_router.get("/", response_class=HTMLResponse)
+async def chat_ui(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user:
+        return RedirectResponse(url="/login", status_code=303)
+    is_admin = has_permission(user.role, "add_users")
+    dn = user.username
+    try:
+        conn = sqlite3.connect(_user_db())
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT display_name FROM users WHERE username = ?", (user.username,)).fetchone()
+        conn.close()
+        if row and row["display_name"]:
+            dn = row["display_name"]
+    except Exception:
+        pass
+    return HTMLResponse(_chat_html(user.username, dn, user.role, is_admin))
+
+@web_router.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user or not has_permission(user.role, "add_users"):
+        return RedirectResponse(url="/", status_code=303)
+    pending = get_pending_registrations()
+    users = list_users()
+    return HTMLResponse(_admin_html(pending, users, user.username))
+
+@web_router.post("/admin/approve")
+async def admin_approve(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user or not has_permission(user.role, "add_users"):
+        return RedirectResponse(url="/", status_code=303)
+    form = await request.form()
+    request_id = int(form.get("request_id", 0))
+    role = str(form.get("role", "staff"))
+    try:
+        new_user = approve_registration(request_id, user.username, role)
+        await _broadcast_system(f"Registration approved: {new_user.username} can now log in as {role}.")
+    except ValueError as e:
+        log.warning("Approve failed: %s", e)
+    return RedirectResponse(url="/admin", status_code=303)
+
+@web_router.post("/admin/reject")
+async def admin_reject(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user or not has_permission(user.role, "add_users"):
+        return RedirectResponse(url="/", status_code=303)
+    form = await request.form()
+    request_id = int(form.get("request_id", 0))
+    reason = str(form.get("reason", ""))
+    try:
+        reject_registration(request_id, user.username, reason)
+    except ValueError as e:
+        log.warning("Reject failed: %s", e)
+    return RedirectResponse(url="/admin", status_code=303)
+
+@web_router.post("/admin/role")
+async def admin_set_role(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user or not has_permission(user.role, "add_users"):
+        return RedirectResponse(url="/", status_code=303)
+    form = await request.form()
+    username = str(form.get("username", ""))
+    role = str(form.get("role", "staff"))
+    try:
+        update_user_role(username, role)
+    except ValueError as e:
+        log.warning("Role update failed: %s", e)
+    return RedirectResponse(url="/admin", status_code=303)
+
+@web_router.post("/admin/suspend")
+async def admin_suspend(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user or not has_permission(user.role, "add_users"):
+        return RedirectResponse(url="/", status_code=303)
+    form = await request.form()
+    suspend_user(str(form.get("username", "")))
+    return RedirectResponse(url="/admin", status_code=303)
+
+@web_router.post("/admin/reactivate")
+async def admin_reactivate(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user or not has_permission(user.role, "add_users"):
+        return RedirectResponse(url="/", status_code=303)
+    form = await request.form()
+    reactivate_user(str(form.get("username", "")))
+    return RedirectResponse(url="/admin", status_code=303)
+
+@web_router.get("/api/history")
+async def api_history():
+    return JSONResponse(await _get_history(100))
+
+@web_router.get("/api/online")
+async def api_online():
+    users = [{"username": u, "display_name": _user_display.get(u, u), "role": _user_roles.get(u, "")} for u in _active_ws]
+    return JSONResponse(users)
+
+@web_router.get("/api/status")
+async def api_status():
+    try:
+        from app.state_manager import get_state_manager
+        sm = get_state_manager()
+        return JSONResponse({"mode": sm.current_state, "ok": True})
+    except Exception:
+        return JSONResponse({"mode": "unknown", "ok": False})
+
+@web_router.get("/api/polls")
+async def api_polls(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user:
+        return JSONResponse([])
+    return JSONResponse(await _get_open_polls())
+
+@web_router.post("/api/polls")
+async def api_create_poll(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user:
+        return JSONResponse({"error": "unauthorised"}, status_code=401)
+    data = await request.json()
+    question = str(data.get("question", "")).strip()
+    options = data.get("options", [])
+    poll_type = str(data.get("poll_type", "single_select"))
+    if not question or len(options) < 2:
+        return JSONResponse({"error": "question and at least 2 options required"}, status_code=400)
+    ts = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(_audit_db()) as conn:
+        cur = await conn.execute(
+            "INSERT INTO polls (ts, created_by, question, options, poll_type, status) VALUES (?, ?, ?, ?, ?, 'open')",
+            (ts, user.username, question, json.dumps(options), poll_type),
+        )
+        poll_id = cur.lastrowid
+        await conn.commit()
+    polls = await _get_open_polls()
+    poll = next((p for p in polls if p["id"] == poll_id), None)
+    if poll:
+        await _broadcast({"type": "poll", "poll": poll})
+    return JSONResponse({"success": True, "poll_id": poll_id})
+
+@web_router.post("/api/polls/{poll_id}/vote")
+async def api_vote(request: Request, poll_id: int):
+    user = _get_user_from_cookie(request)
+    if not user:
+        return JSONResponse({"error": "unauthorised"}, status_code=401)
+    data = await request.json()
+    responses = data.get("responses", [])
+    ts = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(_audit_db()) as conn:
+        for r in responses:
+            await conn.execute(
+                "INSERT INTO poll_responses (ts, poll_id, username, response) VALUES (?, ?, ?, ?)",
+                (ts, poll_id, user.username, r),
+            )
+        await conn.commit()
+    return JSONResponse({"success": True})
+
+@web_router.post("/api/save_agent_message")
+async def api_save_agent(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user:
+        return JSONResponse({"ok": False})
+    data = await request.json()
+    content = str(data.get("content", ""))
+    if content:
+        await _save_message("agent", "CDCN Agent", "agent", "agent", content)
+    return JSONResponse({"ok": True})
+
+@web_router.post("/upload")
+async def upload_documents(request: Request):
+    user = _get_user_from_cookie(request)
+    if not user:
+        return JSONResponse({"error": "unauthorised"}, status_code=401)
+    docs_dir = Path(settings.watched_folder)
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    form = await request.form()
+    saved = []
+    for field in form.values():
+        if hasattr(field, "filename") and field.filename:
+            dest = docs_dir / field.filename
+            data = await field.read()
+            if len(data) == 0:
+                continue
+            with dest.open("wb") as fh:
+                fh.write(data)
+            saved.append(field.filename)
+    if saved:
+        display = _user_display.get(user.username, user.username)
+        await _broadcast_system(f"{display} uploaded: {', '.join(saved)} — indexing now...")
+        try:
+            from app.skills.indexer import IndexerSkill
+            indexer = IndexerSkill()
+            result = await indexer.run({})
+            indexed = result.metadata.get("indexed", 0) if result.success else 0
+            await _broadcast_system(f"Indexing complete: {indexed} file(s) added to archive.")
+        except Exception as e:
+            log.warning("Indexer failed after upload: %s", e)
+            await _broadcast_system("Indexing failed — please retry manually.")
+        return JSONResponse({"message": f"Uploaded: {', '.join(saved)}"})
+    return JSONResponse({"message": "No files received."})
+
+@web_router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    user = _get_user_from_cookie(websocket)
+    if not user:
+        await websocket.close(code=4001)
+        return
+    await websocket.accept()
+    dn = user.username
+    try:
+        conn = sqlite3.connect(_user_db())
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT display_name FROM users WHERE username = ?", (user.username,)).fetchone()
+        conn.close()
+        if row and row["display_name"]:
+            dn = row["display_name"]
+    except Exception:
+        pass
+    _active_ws[user.username] = websocket
+    _user_display[user.username] = dn
+    _user_roles[user.username] = user.role
+    log.info("WebSocket connected: user=%s display=%s", user.username, dn)
+    await _broadcast_system(f"{dn} joined.", save=False)
+    await _broadcast_online()
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if data.get("ping"):
+                continue
+            message = str(data.get("message", "")).strip()
+            if not message:
+                continue
+            await _broadcast_user_msg(user.username, dn, user.role, message)
+            try:
+                from app.state_manager import get_state_manager
+                if not get_state_manager().is_accepting_messages():
+                    rest = f"CDCN Agent is in rest mode until {settings.wake_start_time}."
+                    await _save_message("agent", "CDCN Agent", "agent", "agent", rest)
+                    await _broadcast({"type": "token", "content": rest})
+                    await _broadcast({"type": "done"})
+                    continue
+            except Exception:
+                pass
+            from app.gateway.router import _get_agent_router
+            router = _get_agent_router()
+            if not router:
+                await _broadcast({"type": "error", "detail": "Agent not ready."})
+                continue
+            session_key = f"web:{user.username}"
+            try:
+                async for token in router.handle_message(
+                    message=f"[{dn}]: {message}",
+                    user_id=session_key,
+                    role=user.role,
+                    channel_id="web",
+                ):
+                    await _broadcast({"type": "token", "content": token})
+                await _broadcast({"type": "done"})
+            except Exception as exc:
+                log.error("Router error: %s", exc)
+                await _broadcast({"type": "error", "detail": "Error reaching language model."})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _active_ws.pop(user.username, None)
+        _user_display.pop(user.username, None)
+        _user_roles.pop(user.username, None)
+        log.info("WebSocket disconnected: user=%s", user.username)
+        await _broadcast_system(f"{dn} left.", save=False)
+        await _broadcast_online()
+
+class WebAdapter(BaseAdapter):
+    async def start(self) -> None:
+        log.info("WebAdapter: routes registered via web_router.")
+    async def stop(self) -> None:
+        log.info("WebAdapter: stopped.")
+    async def send_message(self, channel_id: str, text: str) -> None:
+        username = channel_id.replace("web:", "")
+        ws = _active_ws.get(username)
+        if ws:
+            try:
+                await ws.send_text(json.dumps({"type": "token", "content": text}))
+                await ws.send_text(json.dumps({"type": "done"}))
+            except Exception:
+                pass

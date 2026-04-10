@@ -1,0 +1,19 @@
+{
+  "name": "cdcn-agent",
+  "version": "1.0.0",
+  "description": "CDCN Agent is an always-on AI assistant for a Scottish community development charity. It indexes the organisation's documents — board minutes, funding applications, governance policies — into a local vector database, answers staff and trustee queries in plain English, drafts new documents using the organisation's templates, and runs overnight analysis tasks to surface funding deadlines, flag stale policies, and refine its own knowledge. Everything runs on hardware you own, inside your network, with no data leaving the building.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "docx": "^9.6.1"
+  }
+}

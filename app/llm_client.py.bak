@@ -1,0 +1,297 @@
+"""
+CDCNLLMClient — async Ollama HTTP client with audit logging and hot-swap support.
+
+The module-level singleton `llm_client` is wired to wake-state settings by default.
+StateManager calls `llm_client.configure(...)` when switching to/from DREAM mode.
+
+Module-level helpers `chat()`, `embed()`, and `dream_chat()` are kept for backward
+compatibility with skills that import them directly.
+"""
+import json
+import logging
+import time
+from collections.abc import AsyncGenerator
+
+import httpx
+
+from app.config import settings
+
+log = logging.getLogger(__name__)
+
+
+class CDCNLLMError(Exception):
+    """Raised on connection failure or any non-200 response from Ollama."""
+
+
+class CDCNLLMClient:
+    """
+    Async Ollama client.
+
+    Supports streaming and non-streaming chat, and embeddings.
+    Every call is logged to the audit log (model, tokens, latency, skill).
+
+    Instantiated once as a module-level singleton.  StateManager swaps
+    base_url/model when entering or leaving DREAM mode.
+    """
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        model: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        self.base_url = (base_url or settings.ollama_base_url).rstrip("/")
+        self.model = model or settings.ollama_model
+        # None means "use settings"; empty string means "no key"
+        self.api_key = api_key if api_key is not None else settings.ollama_api_key
+
+    def configure(self, base_url: str, model: str) -> None:
+        """Hot-swap endpoint and model — called by StateManager on mode change."""
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        log.info("LLMClient reconfigured: base_url=%s model=%s", self.base_url, self.model)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        if self.api_key:
+            return {"Authorization": f"Bearer {self.api_key}"}
+        return {}
+
+    def _build_messages(
+        self, messages: list[dict], system_prompt: str | None
+    ) -> list[dict]:
+        """Prepend a system message if one is provided."""
+        if system_prompt:
+            return [{"role": "system", "content": system_prompt}] + list(messages)
+        return list(messages)
+
+    async def _audit(
+        self,
+        action: str,
+        *,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        latency_ms: int = 0,
+        skill_used: str = "",
+    ) -> None:
+        """Write one row to the audit log (non-fatal — never raises)."""
+        try:
+            from app.storage.audit_log import log_event
+
+            await log_event(
+                actor="llm_client",
+                action=action,
+                target=self.model,
+                detail=json.dumps(
+                    {
+                        "model": self.model,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "latency_ms": latency_ms,
+                        "skill_used": skill_used,
+                    }
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Audit log write failed: %s", exc)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    async def chat_stream(
+        self,
+        messages: list[dict],
+        system_prompt: str | None = None,
+        skill_used: str = "",
+    ) -> AsyncGenerator[str, None]:
+        """
+        Stream tokens from Ollama /chat/completions.
+
+        Yields text chunks as they arrive from NDJSON stream.
+        Token counts and latency are logged to the audit log when the
+        stream completes or is closed (via finally block).
+        Raises CDCNLLMError on connection failure or non-200.
+        """
+        payload = {
+            "model": self.model,
+            "messages": self._build_messages(messages, system_prompt),
+            "stream": True,
+        }
+        t0 = time.monotonic()
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        try:
+            async with httpx.AsyncClient(timeout=300) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/api/chat",
+                    json=payload,
+                    headers=self._headers,
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        raise CDCNLLMError(
+                            f"Ollama returned {resp.status_code}: {body.decode()[:300]}"
+                        )
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        token = chunk.get("message", {}).get("content", "")
+                        if token:
+                            yield token
+                        if chunk.get("done"):
+                            prompt_tokens = chunk.get("prompt_eval_count", 0)
+                            completion_tokens = chunk.get("eval_count", 0)
+                            break
+        except httpx.ConnectError as exc:
+            raise CDCNLLMError(
+                f"Cannot connect to Ollama at {self.base_url}: {exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise CDCNLLMError(
+                f"HTTP error communicating with Ollama: {exc}"
+            ) from exc
+        finally:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            try:
+                await self._audit(
+                    "chat_stream",
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    latency_ms=latency_ms,
+                    skill_used=skill_used,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def chat(
+        self,
+        messages: list[dict],
+        system_prompt: str | None = None,
+        skill_used: str = "",
+    ) -> str:
+        """
+        Non-streaming chat — blocks until the full response arrives.
+
+        Returns the assistant message content string.
+        Raises CDCNLLMError on connection failure or non-200.
+        """
+        payload = {
+            "model": self.model,
+            "messages": self._build_messages(messages, system_prompt),
+            "stream": False,
+        }
+        log.info("Making LLM call to %s model=%s", self.base_url, self.model)
+        t0 = time.monotonic()
+        prompt_tokens = 0
+        completion_tokens = 0
+
+        try:
+            async with httpx.AsyncClient(timeout=300) as client:
+                resp = await client.post(
+                    f"{self.base_url}/api/chat",
+                    json=payload,
+                    headers=self._headers,
+                )
+                if resp.status_code != 200:
+                    raise CDCNLLMError(
+                        f"Ollama returned {resp.status_code}: {resp.text[:300]}"
+                    )
+                data = resp.json()
+                content: str = data.get("message", {}).get("content", "")
+                prompt_tokens = data.get("prompt_eval_count", 0)
+                completion_tokens = data.get("eval_count", 0)
+                return content
+        except httpx.ConnectError as exc:
+            raise CDCNLLMError(
+                f"Cannot connect to Ollama at {self.base_url}: {exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise CDCNLLMError(
+                f"HTTP error communicating with Ollama: {exc}"
+            ) from exc
+        finally:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            await self._audit(
+                "chat",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=latency_ms,
+                skill_used=skill_used,
+            )
+
+    async def embed(self, text: str) -> list[float]:
+        """
+        Embed text via Ollama /api/embeddings.
+
+        Always uses the configured embed model from settings (not swapped
+        by mode changes — embeddings always run on the R710).
+        Raises CDCNLLMError on failure.
+        """
+        t0 = time.monotonic()
+        try:
+            embed_url = "http://127.0.0.1:11434"
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"{embed_url}/api/embeddings",
+                    json={"model": settings.ollama_embed_model, "prompt": text},
+                    headers=self._headers,
+                )
+                if resp.status_code != 200:
+                    raise CDCNLLMError(
+                        f"Ollama embed returned {resp.status_code}: {resp.text[:300]}"
+                    )
+                return resp.json()["embedding"]
+        except httpx.ConnectError as exc:
+            raise CDCNLLMError(
+                f"Cannot connect to Ollama at {self.base_url}: {exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise CDCNLLMError(f"HTTP error on embed: {exc}") from exc
+        finally:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            await self._audit("embed", latency_ms=latency_ms)
+
+
+# ── Module-level singleton ────────────────────────────────────────────────────
+# StateManager.set_mode() calls .configure() to swap endpoint/model.
+
+llm_client = CDCNLLMClient()
+
+
+# ── Backward-compat helpers used by existing skills ───────────────────────────
+
+
+async def chat(
+    messages: list[dict],
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    stream: bool = False,
+) -> str:
+    """Thin shim used by WriterSkill and others — delegates to singleton."""
+    if base_url or model:
+        # One-off call to a different endpoint (e.g. dream_chat)
+        tmp = CDCNLLMClient(base_url=base_url, model=model)
+        return await tmp.chat(messages)
+    return await llm_client.chat(messages)
+
+
+async def embed(text: str, *, model: str | None = None) -> list[float]:
+    """Used by SearchSkill — delegates to singleton."""
+    return await llm_client.embed(text)
+
+
+async def dream_chat(messages: list[dict]) -> str:
+    """Used by MemorySkill and DreamWorkerSkill — always targets Pi 5 model."""
+    return await chat(
+        messages,
+        model=settings.dream_model,
+        base_url=settings.dream_ollama_base_url,
+    )

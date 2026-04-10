@@ -1,0 +1,1370 @@
+"""
+AgentRouter — agentic loop (skill detection, execution, memory consolidation).
+gateway_router — FastAPI APIRouter exposed to main.py (/api prefix).
+
+The two concerns live in one file so the FastAPI /chat endpoint can share the
+AgentRouter singleton without a circular import.
+
+Agentic loop (per OpenCLAW pattern, adapted for Python / Ollama):
+  1. Prompt-injection guard
+  2. Load or create session
+  3. Get system prompt (60 s TTL cache from memory_skill)
+  4. Prefetch cache lookup for quick context
+  5. Append user message to history
+  6. First LLM call (non-streaming — need full text to detect skill call)
+  7. If response contains a fenced JSON skill call: execute skill, re-prompt
+  8. Stream final response to caller
+  9. Persist session; at every 10th exchange trigger async memory consolidation
+"""
+import asyncio
+import json
+import logging
+import re
+import time
+from collections.abc import AsyncGenerator
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from app.auth.auth import User, check_rate_limit, get_current_user
+from app.config import settings
+from app.gateway import identity_map
+from app.gateway.session import Session, SessionManager
+from app.llm_client import CDCNLLMClient, CDCNLLMError, llm_client
+from app.skills.base import BaseSkill
+from app.storage.audit_log import log_event
+from app.state_manager import state
+
+log = logging.getLogger(__name__)
+
+# ── Prompt injection detection ────────────────────────────────────────────────
+# Patterns are compiled once at import time.  Checked before any LLM call.
+
+_INJECTION_PATTERNS: list[re.Pattern] = [
+    re.compile(r"ignore\s+previous\s+instructions", re.IGNORECASE),
+    re.compile(r"(?<!\w)system\s*:", re.IGNORECASE),
+    re.compile(r"^###", re.MULTILINE),
+]
+
+# ── Skill-call extraction ─────────────────────────────────────────────────────
+# Matches a JSON object containing "skill" inside a fenced code block.
+# The LLM is instructed to use exactly this format.
+
+_SKILL_CALL_RE = re.compile(
+    r"```(?:json)?\s*(\{[^`]*\"skill\"[^`]*\})\s*```",
+    re.DOTALL,
+)
+
+# ── GLM-5 XML tool-call fallback ──────────────────────────────────────────────
+# GLM-5 (SiliconFlow) sometimes emits its own <tool_call> XML format in the
+# content field rather than using OpenAI function calling.  We detect and
+# handle this so raw XML is never forwarded to users.
+#
+# Observed formats:
+#   <tool_call>search<arg_key>query</arg_key><arg_value>...</arg_value></tool_call>
+#   <tool_call>search<arg_key>query</arg_key><arg_value>...</arg_value>
+#             <arg_key>doc_type</arg_key><arg_value>minutes</arg_value></tool_call>
+
+_XML_TOOL_CALL_RE = re.compile(
+    r"<tool_call>(\w+)(.*?)</tool_call>",
+    re.DOTALL,
+)
+_XML_ARG_RE = re.compile(
+    r"<arg_key>([^<]*)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+    re.DOTALL,
+)
+
+# Matches fenced code blocks that contain leaked skill-call JSON (has "skill" key).
+# Does NOT match legitimate code blocks (tables, examples, text wrapping).
+_FENCED_BLOCK_RE_SKILL = re.compile(
+    r'```(?:json)?\s*\n\s*\{[^}]*"skill"\s*:.*?\}\s*\n```',
+    re.DOTALL,
+)
+
+
+def _clean_llm_response(text: str) -> str:
+    """
+    Strip artefacts that should never reach the user:
+      - Fenced code blocks that contain leaked skill-call JSON
+      - XML <tool_call> blocks (GLM-5 format that bypassed the XML handler)
+    Preserves legitimate code blocks (tables, examples, plain text wrapping).
+    Collapses any resulting runs of blank lines to a single blank line.
+    """
+    cleaned = _FENCED_BLOCK_RE_SKILL.sub("", text)
+    cleaned = _XML_TOOL_CALL_RE.sub("", cleaned)
+    # If the LLM wrapped the entire response in a single fenced block,
+    # unwrap it rather than stripping it.
+    _unwrap = re.match(r"^\s*```[a-zA-Z]*\n(.*?)```\s*$", cleaned, re.DOTALL)
+    if _unwrap:
+        cleaned = _unwrap.group(1)
+    # Collapse 3+ consecutive newlines to 2
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+# Maximum additional tool-call rounds allowed when the LLM re-emits tool calls
+# in the final response step instead of answering the user.
+_MAX_TOOL_ROUNDS = 3
+
+# Instruction appended to the system prompt for the post-tool-call streaming step.
+# Prevents GLM-5 from re-emitting tool call syntax in the final answer.
+_NO_MORE_TOOLS_SUFFIX = (
+    "\n\n## IMPORTANT — FINAL RESPONSE RULES\n"
+    "You have just received the result of a tool/skill call. "
+    "Write your reply to the user now using plain, natural language. "
+    "Do NOT output any tool call, JSON block, XML tag, or skill invocation syntax. "
+    "Just answer the question or confirm the action in conversational prose.\n\n"
+    "CITATION RULES: For every factual claim, include a citation in the format "
+    "[Document Name, Date, Section]. If a claim is not supported by the provided "
+    "context, mark it explicitly as [UNVERIFIED]. CDCN is a registered charity — "
+    "incorrect information about governance decisions or financial figures could "
+    "have real consequences."
+)
+
+# Verification prompt for post-response citation checking
+_VERIFICATION_PROMPT = (
+    "Review the following response for citation accuracy. For each factual claim:\n"
+    "1. Does every claim have a citation in [Document Name, Date, Section] format?\n"
+    "2. Is any claim not supported by the provided context?\n"
+    "If any claims lack citations or are unsupported, return ONLY the corrected "
+    "response with [UNVERIFIED] tags added. If all claims are properly cited, "
+    "return the response unchanged. Do not add commentary."
+)
+
+
+# ── System-prompt cache ───────────────────────────────────────────────────────
+# Keyed by role string.  Value is (prompt_text, monotonic_timestamp).
+
+_PROMPT_CACHE: dict[str, tuple[str, float]] = {}
+_PROMPT_CACHE_TTL = 60.0  # seconds
+
+
+# ── AgentRouter ───────────────────────────────────────────────────────────────
+
+
+class AgentRouter:
+    """
+    Orchestrates the full agentic turn: guard → session → prompt → LLM → skill
+    → final response → persist → optional consolidation.
+
+    Intended to be instantiated once (module-level singleton via _get_router()).
+    """
+
+    def __init__(
+        self,
+        skills: dict[str, BaseSkill],
+        llm: CDCNLLMClient,
+        memory_skill,
+    ) -> None:
+        self.skills = skills
+        self.llm = llm
+        self.memory_skill = memory_skill
+        self._sessions = SessionManager()
+
+    # ── Public entry point ────────────────────────────────────────────────────
+
+    async def handle_message(
+        self,
+        user_id: str,
+        role: str,
+        message: str,
+        channel_id: str = "",
+        display_name: str = "",
+    ) -> AsyncGenerator[str, None]:
+        """
+        Full agentic turn.  Yields text tokens suitable for StreamingResponse.
+
+        Never raises — errors are yielded as human-readable messages so the
+        caller always receives a complete response.
+        """
+        log.info("handle_message called: user=%s message=%s", user_id, message[:50])
+
+        # ── Identity linking: handle "yes" / "no" responses to link prompts ──
+        if not hasattr(self, "_pending_links"):
+            self._pending_links: dict[str, str] = {}
+        if not hasattr(self, "_declined_links"):
+            self._declined_links: set[str] = set()
+
+        if user_id.startswith("discord:") and not identity_map.is_linked(user_id):
+            _answer = message.strip().lower()
+            if _answer in ("yes", "yep", "yeah", "aye", "y"):
+                pending = self._pending_links.pop(user_id, None)
+                if pending:
+                    identity_map.link(user_id, pending)
+                    yield (
+                        f"Thanks! I've linked your Discord account to your "
+                        f"web account ({pending.split(':', 1)[1]}). "
+                        f"Your conversation history is now shared across both."
+                    )
+                    return
+            elif _answer in ("no", "nope", "nah", "n"):
+                if self._pending_links.pop(user_id, None):
+                    self._declined_links.add(user_id)
+                    yield "No problem — I'll keep your accounts separate."
+                    return
+
+        # ── 0. Rate limit ─────────────────────────────────────────────────────
+        if not check_rate_limit(user_id):
+            yield "Request rate limit reached (20 per minute). Please wait a moment."
+            return
+
+        # ── 1. Prompt injection guard ─────────────────────────────────────────
+        if self._is_injection(message):
+            await log_event(
+                actor=user_id,
+                action="injection_rejected",
+                target=channel_id,
+                detail=message[:300],
+            )
+            yield (
+                "I'm sorry, I can't process that request. "
+                "Please rephrase and try again."
+            )
+            return
+
+        # ── 1a. Identity linking check for Discord users ─────────────────────
+        if (
+            user_id.startswith("discord:")
+            and display_name
+            and not identity_map.is_linked(user_id)
+            and user_id not in self._pending_links
+            and user_id not in self._declined_links
+        ):
+            match = self._find_matching_web_user(display_name)
+            if match:
+                self._pending_links[user_id] = f"web:{match}"
+                yield (
+                    f"Hi {display_name}! I notice your name matches "
+                    f"a web account ({match}). Are you the same person? "
+                    f"If so, I can link your accounts so we share the same "
+                    f"conversation history across Discord and the website. "
+                    f"Just reply **yes** or **no**."
+                )
+                return
+
+        # ── 2. Session ────────────────────────────────────────────────────────
+        session = self._sessions.load_or_create(user_id, role)
+
+        # ── 3. System prompt (60 s TTL cache) ────────────────────────────────
+        system_prompt = await self._get_system_prompt(role)
+
+        log.info("System prompt loaded, making LLM call")
+        # ── 4. Prefetch cache ─────────────────────────────────────────────────
+        prefetch_ctx = self._check_prefetch(message)
+
+        # ── 5. Append user message (RAG context merged in below) ────────────
+        user_content = message
+        if prefetch_ctx:
+            user_content = (
+                f"{message}\n\n"
+                f"[Relevant pre-loaded context]\n{prefetch_ctx}"
+            )
+        # ── 5a. Parent-child RAG injection ─────────────────────────────────
+        # Accuracy-first: any question or CDCN-related query triggers search.
+        _doc_keywords = [
+            "minute", "minutes", "meeting", "attended", "present", "apolog",
+            "agenda", "policy", "policies", "report", "trustee", "trustees",
+            "funding", "grant", "application", "plan", "strategy", "constitution",
+            "who was", "who attended", "who are", "who is", "decision", "decided",
+            "agreed", "action point", "action item", "discussed", "discussion",
+            "what was", "what were", "what did", "what does", "what is the",
+            "according to", "what happened", "tell me about", "find information",
+            "download", "fetch", "send me", "get me the", "give me the",
+            "can i have", "the file", "the document", "the pdf",
+            "the policy", "the plan", "the agenda", "archive",
+            "solar", "polycrub", "scrapstore", "gym", "energy", "nesting",
+            "cdcn", "community", "budget", "cost", "project", "approved",
+            "voted", "resolved", "shetland", "aald skul", "aald skül",
+            "highland", "oscr", "charity", "board",
+            "dream", "journal", "overnight", "dream mode", "consolidation",
+        ]
+        _msg_lower = message.lower().strip()
+        _question_words = ("what", "who", "when", "where", "how", "why", "which",
+                           "tell me", "show me", "find", "can you", "could you",
+                           "is there", "are there", "do we", "does cdcn", "have we")
+        _is_question = (
+            "?" in message
+            or any(_msg_lower.startswith(w) for w in _question_words)
+            or len(message.split()) >= 8
+        )
+        _needs_rag = _is_question or any(k in _msg_lower for k in _doc_keywords)
+        if _needs_rag:
+            try:
+                from app.skills.search import search as rag_search
+
+                # Detect doc_type hint from query
+                _rag_doc_type = None
+                _ml = message.lower()
+                if any(k in _ml for k in ["business plan", "plan"]):
+                    _rag_doc_type = ["plan"]
+                elif any(k in _ml for k in ["policy", "policies"]):
+                    _rag_doc_type = ["policy"]
+                elif any(k in _ml for k in ["funding", "grant", "application"]):
+                    _rag_doc_type = ["funding"]
+                elif any(k in _ml for k in ["agm", "annual general"]):
+                    _rag_doc_type = ["agm_minutes"]
+                elif any(k in _ml for k in ["report", "trustees report", "annual report"]):
+                    _rag_doc_type = ["report"]
+
+                # Run parent-child search with full parent context
+                _search_result = await rag_search(
+                    query=message,
+                    doc_type=_rag_doc_type,
+                    top_k=15,
+                    return_parents=True,
+                )
+                # If typed search returned few results, also do unfiltered search
+                if _rag_doc_type and len(_search_result.hits) < 5:
+                    _unfiltered = await rag_search(
+                        query=message,
+                        top_k=15,
+                        return_parents=True,
+                    )
+                    # Merge: add unfiltered hits not already present
+                    _seen_pids = {h.parent_id for h in _search_result.hits if h.parent_id}
+                    for h in _unfiltered.hits:
+                        if h.parent_id not in _seen_pids:
+                            _search_result.hits.append(h)
+                            _seen_pids.add(h.parent_id)
+
+                # Load dream journals if query is about dream/overnight activity
+                _journal_context = ""
+                if any(k in message.lower() for k in ["dream", "overnight", "journal", "consolidation"]):
+                    from pathlib import Path as _Path
+                    _journal_dir = _Path("/var/lib/cdcn-agent/memory/journal")
+                    if _journal_dir.exists():
+                        _journal_parts = []
+                        _jchars = 0
+                        for jf in sorted(_journal_dir.iterdir(), reverse=True)[:5]:
+                            if jf.is_file() and _jchars < 30000:
+                                try:
+                                    jtext = jf.read_text()
+                                    _journal_parts.append(f"=== JOURNAL: {jf.name} ===\n{jtext}")
+                                    _jchars += len(jtext)
+                                except Exception:
+                                    pass
+                        _journal_context = "\n\n".join(_journal_parts)
+
+                if _search_result.hits or _journal_context:
+                    # Assemble context from parent chunks with citations
+                    _context_parts = []
+                    for hit in _search_result.hits:
+                        _context_parts.append(
+                            f"=== {hit.citation} ===\n{hit.content}"
+                        )
+                    _docs_context = "\n\n".join(_context_parts)
+
+                    # Build file list for download links
+                    _docs_dir = Path(settings.watched_folder)
+                    _file_list = ", ".join(
+                        str(f.relative_to(_docs_dir))
+                        for f in sorted(_docs_dir.rglob("*"))
+                        if f.is_file()
+                    )
+
+                    _combined = "\n\n".join(filter(None, [_journal_context, _docs_context]))
+                    _rag_prefix = (
+                        "The relevant CDCN documents have ALREADY been retrieved for this question. "
+                        "DO NOT call search_archive — answer directly from the documents below. "
+                        "Use specific quotes, names, dates, and figures. "
+                        "CITE EVERY FACTUAL CLAIM with [Document Name, Date, Section]. "
+                        "If you cannot find a citation, say so explicitly.\n\n"
+                        "DOCUMENT DOWNLOADS: If relevant, provide download links using: "
+                        f"/api/archive/download?path=RELATIVE_PATH — available files: {_file_list}\n"
+                        "URL-encode spaces as %20.\n\n"
+                    )
+                    # Merge RAG context directly into the user message
+                    user_content = (
+                        f"{message}\n\n"
+                        f"--- RETRIEVED DOCUMENTS (answer from these) ---\n\n"
+                        f"{_rag_prefix}"
+                        f"{_combined}"
+                    )
+                    self._rag_injected = True
+                    log.info("RAG injected: %d parent sections, %d children matched, chars=%d",
+                             len(_search_result.hits), _search_result.total_children_matched,
+                             len(_combined))
+                else:
+                    log.info("RAG: no relevant documents found for query")
+            except Exception as e:
+                log.warning("RAG failed: %s", e)
+
+        self._current_role = role
+        session.messages.append({"role": "user", "content": user_content,
+                                   "_ts": datetime.now(timezone.utc).isoformat()})
+
+        # ── 5b. Direct writer skill intercept ─────────────────────────────────
+        _write_keywords = ["draft", "write me", "create a document", "prepare a",
+                           "funding application", "board minute", "governance policy",
+                           "trustees report", "trustee report", "annual report",
+                           "write a funding", "draft a funding", "help me write",
+                           "can you draft", "can you write", "can you prepare",
+                           "create a funding", "prepare a funding"]
+        _wants_document = any(k in message.lower() for k in _write_keywords)
+        if _wants_document and role in ("admin", "staff"):
+            try:
+                _msg_lower = message.lower()
+                if any(k in _msg_lower for k in ["trustee", "trustees", "trustees report",
+                           "annual report", "trustee report", "yearly report"]):
+                    _template = "trustees_report"
+                elif any(k in _msg_lower for k in ["funding", "application", "grant"]):
+                    _template = "funding_application"
+                elif any(k in _msg_lower for k in ["minute", "minutes"]):
+                    _template = "board_minute"
+                elif any(k in _msg_lower for k in ["policy", "governance"]):
+                    _template = "governance_policy"
+                else:
+                    _template = "funding_application"
+                
+                log.info("Direct writer intercept: template=%s", _template)
+                writer_skill = self.skills.get("writer")
+                if writer_skill:
+                    # Run multiple RAG searches to gather context for the document
+                    _extra_context = ""
+                    try:
+                        from app.skills.search import SearchSkill
+                        _search = SearchSkill()
+                        context_parts = []
+                        
+                        # Generate search queries based on the user's request
+                        # Always search with the original message
+                        _queries = [message]
+                        
+                        # Add template-specific queries
+                        if _template == "trustees_report":
+                            _queries.extend([
+                                "board meeting minutes decisions actions",
+                                "funding grants applications received",
+                                "staff volunteering governance AGM",
+                                "projects achievements community development",
+                                "scrapstore gym polycrub energy solar",
+                                "housing childcare community action plan",
+                                "trustee report annual review",
+                            ])
+                        elif _template == "funding_application":
+                            _queries.extend([
+                                "funding grants budget costs",
+                                "project outcomes community benefit",
+                                "organisation capacity staff volunteers",
+                            ])
+                        elif _template == "board_minute":
+                            _queries.extend([
+                                "board meeting decisions resolutions",
+                                "action points agreed tasks",
+                            ])
+                        elif _template == "governance_policy":
+                            _queries.extend([
+                                "governance policy procedures",
+                                "OSCR charity compliance",
+                            ])
+                        
+                        # Run all searches with larger result sets
+                        seen_excerpts = set()
+                        for q in _queries:
+                            try:
+                                sr = await _search.run({"query": q, "n_results": 10})
+                                if sr.success and sr.output:
+                                    for line in sr.output.split("\n\n"):
+                                        # Deduplicate by first 100 chars
+                                        key = line[:100]
+                                        if key not in seen_excerpts:
+                                            seen_excerpts.add(key)
+                                            context_parts.append(line)
+                            except Exception as e:
+                                log.debug("Search query failed: %s — %s", q, e)
+                        
+                        if context_parts:
+                            _extra_context = "\n\n".join(context_parts)
+                            log.info("RAG gathered %d unique excerpts for writer skill", len(context_parts))
+                    except Exception as e:
+                        log.warning("RAG context gathering failed: %s", e)
+                    
+                    result = await writer_skill.run(
+                        template=_template, brief=message,
+                        context=_extra_context if _extra_context else "")
+                    if result.success:
+                        _dl_info = ""
+                        if result.metadata.get("download_url"):
+                            _dl_info = (
+                                f"\n\nA Word document has been generated and is ready to download: "
+                                f"{result.metadata['download_url']}"
+                            )
+                        session.messages.append({
+                            "role": "user",
+                            "content": (
+                                f"[The writer skill has drafted a document based on the user's request. "
+                                f"The draft is {len(result.output)} characters long. "
+                                f"Summarise what was produced in 2-3 sentences and tell the user "
+                                f"they can download it using the link below. "
+                                f"Do NOT reproduce the full document text.]{_dl_info}"
+                            ),
+                        })
+                        log.info("Writer skill completed, passing to LLM for summary")
+            except Exception as e:
+                log.warning("Direct writer intercept failed: %s", e)
+
+        # ── 6–8. LLM → optional skill → final response ────────────────────────
+        response_text = ""
+        skill_used = ""
+        _rag_injected = getattr(self, "_rag_injected", False)
+        self._rag_injected = False  # Reset for next call
+
+        try:
+            # First call: non-streaming with tool definitions
+            tools = self._build_tool_definitions()
+            # If RAG already injected context, remove search_archive from tools
+            # so the LLM answers directly instead of redundantly searching
+            if _rag_injected:
+                tools = [t for t in tools if t["function"]["name"] != "search_archive"]
+            first_result = await self.llm.chat_with_tools(
+                session.messages,
+                system_prompt=system_prompt,
+                tools=tools,
+                user_id=user_id, role=role,
+            )
+
+            first_content = first_result.get("content", "")
+            tool_calls = first_result.get("tool_calls", [])
+
+            # ── 7. Tool call detection ────────────────────────────────────────
+            log.info("LLM first response: content=%s tool_calls=%s",
+                     (first_content or "")[:200],
+                     [tc["name"] for tc in tool_calls])
+
+            if tool_calls:
+                # Use the first tool call
+                tc = tool_calls[0]
+                skill_name = tc["name"]
+                skill_args = tc["arguments"]
+                skill_used = skill_name
+
+                # Append assistant message with tool_calls (OpenAI format)
+                session.messages.append({
+                    "role": "assistant",
+                    "content": first_content or "",
+                    "tool_calls": [{"id": tc["id"], "type": "function",
+                                    "function": {"name": skill_name,
+                                                 "arguments": json.dumps(skill_args)}}],
+                })
+
+                skill_result = await self._execute_skill(skill_name, skill_args)
+
+                # Feed skill result as tool response
+                _dl_url = ""
+                if isinstance(skill_result, dict) and skill_result.get("metadata", {}).get("download_url"):
+                    _dl_url = (
+                        f"\n\nIMPORTANT: A DOCX document was generated. "
+                        f"Include this download link in your response: "
+                        f"{skill_result['metadata']['download_url']}"
+                    )
+                session.messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": json.dumps(skill_result, default=str) + _dl_url,
+                })
+
+                # ── 8. Stream final response ──────────────────────────────────
+                # Buffer all tokens before yielding so we can strip any tool-call
+                # artefacts that GLM-5 re-emits in its streaming content.
+                # GLM-5 sometimes re-emits tool calls instead of answering.
+                # We retry up to _MAX_TOOL_ROUNDS times, executing each tool call
+                # before asking again.  If it still won't answer, we synthesise
+                # a response from the last skill result.
+                _final_prompt = system_prompt + _NO_MORE_TOOLS_SUFFIX
+                for _tool_round in range(_MAX_TOOL_ROUNDS):
+                    log.info("Final response attempt %d after tool call '%s'",
+                             _tool_round + 1, skill_used)
+                    _buf: list[str] = []
+                    async for token in self.llm.chat_stream(
+                        session.messages,
+                        system_prompt=_final_prompt,
+                        skill_used=skill_used,
+                        user_id=user_id, role=role,
+                    ):
+                        _buf.append(token)
+                    _raw_text = "".join(_buf)
+                    response_text = _clean_llm_response(_raw_text)
+                    log.info("Buffered %d raw chars → %d clean chars (round %d)",
+                             len(_raw_text), len(response_text), _tool_round + 1)
+
+                    if response_text:
+                        # Run verification for search-related responses
+                        if skill_used in ("search", "search_archive"):
+                            response_text = await self._verify_response(
+                                response_text, session.messages
+                            )
+                        yield response_text
+                        break
+
+                    # Check if the raw text is another tool call we can execute
+                    _re_call = self._parse_xml_tool_call(_raw_text)
+                    if _re_call and _tool_round < _MAX_TOOL_ROUNDS - 1:
+                        _re_name = _re_call["name"]
+                        _re_args = _re_call["args"]
+                        log.info("LLM re-emitted tool call '%s' in final response — "
+                                 "executing (round %d)", _re_name, _tool_round + 1)
+                        _re_result = await self._execute_skill(_re_name, _re_args)
+                        # Feed the result back as a user message so the next
+                        # round has context to produce a natural answer.
+                        session.messages.append({
+                            "role": "user",
+                            "content": (
+                                f"[Result of skill '{_re_name}']\n"
+                                f"{json.dumps(_re_result, indent=2, default=str)}\n\n"
+                                f"Now please answer the user's original question using "
+                                f"all the tool results above. Do NOT call any more tools."
+                            ),
+                        })
+                        skill_used = _re_name
+                        continue
+
+                    # Raw text was non-empty but cleaning stripped everything
+                    # and it's not a parseable tool call — log and fall through
+                    if _raw_text.strip():
+                        log.warning("_clean_llm_response stripped entire response! "
+                                    "raw=%r", _raw_text[:500])
+                else:
+                    # Exhausted all tool rounds — synthesise from last skill result
+                    log.warning("LLM failed to produce a clean response after %d "
+                                "tool rounds — yielding skill result summary",
+                                _MAX_TOOL_ROUNDS)
+                    yield (
+                        "I found the information but had trouble formatting the "
+                        "response. Here is what the skill returned:\n\n"
+                        + json.dumps(skill_result, indent=2, default=str)[:3000]
+                    )
+
+            else:
+                # No tool call via the API — check for GLM-5 XML tool-call format
+                # in the content field (happens when SiliconFlow ignores tool_choice).
+                xml_call = self._parse_xml_tool_call(first_content)
+                if xml_call:
+                    skill_name = xml_call["name"]
+                    skill_args = xml_call["args"]
+                    skill_used = skill_name
+                    log.info(
+                        "XML tool-call fallback: skill=%s args=%s", skill_name, skill_args
+                    )
+                    # Strip the raw XML from anything shown to the user.
+                    preamble = _XML_TOOL_CALL_RE.sub("", first_content).strip()
+
+                    skill_result = await self._execute_skill(skill_name, skill_args)
+
+                    # Reconstruct conversation so the final LLM call can respond naturally.
+                    if preamble:
+                        session.messages.append({"role": "assistant", "content": preamble})
+                    _dl_url = ""
+                    if isinstance(skill_result, dict) and skill_result.get("metadata", {}).get("download_url"):
+                        _dl_url = (
+                            f"\n\nIMPORTANT: A DOCX document was generated. "
+                            f"Include this download link in your response: "
+                            f"{skill_result['metadata']['download_url']}"
+                        )
+                    session.messages.append({
+                        "role": "user",
+                        "content": (
+                            f"[Result of skill '{skill_name}']\n"
+                            f"{json.dumps(skill_result, indent=2, default=str)}{_dl_url}"
+                        ),
+                    })
+                    _final_prompt = system_prompt + _NO_MORE_TOOLS_SUFFIX
+                    response_text = ""
+                    for _tool_round in range(_MAX_TOOL_ROUNDS):
+                        log.info("XML fallback final response attempt %d", _tool_round + 1)
+                        _buf2: list[str] = []
+                        async for token in self.llm.chat_stream(
+                            session.messages,
+                            system_prompt=_final_prompt,
+                            skill_used=skill_used,
+                            user_id=user_id, role=role,
+                        ):
+                            _buf2.append(token)
+                        _raw2 = "".join(_buf2)
+                        response_text = _clean_llm_response(_raw2)
+                        log.info("XML fallback buffered %d raw → %d clean (round %d)",
+                                 len(_raw2), len(response_text), _tool_round + 1)
+                        if response_text:
+                            break
+                        _re_call2 = self._parse_xml_tool_call(_raw2)
+                        if _re_call2 and _tool_round < _MAX_TOOL_ROUNDS - 1:
+                            _re_name2 = _re_call2["name"]
+                            log.info("XML fallback: LLM re-emitted tool call '%s' — executing", _re_name2)
+                            _re_result2 = await self._execute_skill(_re_name2, _re_call2["args"])
+                            session.messages.append({
+                                "role": "user",
+                                "content": (
+                                    f"[Result of skill '{_re_name2}']\n"
+                                    f"{json.dumps(_re_result2, indent=2, default=str)}\n\n"
+                                    f"Now please answer the user's original question using "
+                                    f"all the tool results above. Do NOT call any more tools."
+                                ),
+                            })
+                            skill_used = _re_name2
+                            continue
+                        if _raw2.strip():
+                            log.warning("XML fallback: cleaned response empty! raw=%r", _raw2[:500])
+                    else:
+                        if not response_text:
+                            log.warning("XML fallback: no clean response after %d rounds", _MAX_TOOL_ROUNDS)
+                            response_text = (
+                                "I found the information but had trouble formatting the "
+                                "response. Here is what the skill returned:\n\n"
+                                + json.dumps(skill_result, indent=2, default=str)[:3000]
+                            )
+                    if response_text:
+                        yield response_text
+                    if response_text:
+                        session.messages.append(
+                            {"role": "assistant", "content": response_text,
+                             "_ts": datetime.now(timezone.utc).isoformat()}
+                        )
+                        session.exchange_count += 1
+                        self._sessions.save(session)
+                    return
+
+                # No tool call at all — yield the content directly.
+                # If provider is Ollama (no tool support), fall back to old regex detection.
+                if not self.llm._is_openai_compat:
+                    skill_call = self._parse_skill_call(first_content)
+                    if skill_call:
+                        skill_name = skill_call.get("skill", "")
+                        skill_args = skill_call.get("args", {})
+                        skill_used = skill_name
+                        skill_result = await self._execute_skill(skill_name, skill_args)
+                        session.messages.append({"role": "assistant", "content": first_content})
+                        _dl_url = ""
+                        if isinstance(skill_result, dict) and skill_result.get("metadata", {}).get("download_url"):
+                            _dl_url = f"\n\nIMPORTANT: Include this download link: {skill_result['metadata']['download_url']}"
+                        session.messages.append({"role": "user", "content":
+                            f"[Result of skill '{skill_name}']\n{json.dumps(skill_result, indent=2, default=str)}{_dl_url}"})
+                        _final_prompt = system_prompt + _NO_MORE_TOOLS_SUFFIX
+                        response_text = ""
+                        for _tr in range(_MAX_TOOL_ROUNDS):
+                            _buf3: list[str] = []
+                            async for token in self.llm.chat_stream(
+                                session.messages, system_prompt=_final_prompt, skill_used=skill_used,
+                                user_id=user_id, role=role):
+                                _buf3.append(token)
+                            _raw3 = "".join(_buf3)
+                            response_text = _clean_llm_response(_raw3)
+                            if response_text:
+                                break
+                            _rc3 = self._parse_xml_tool_call(_raw3)
+                            if _rc3 and _tr < _MAX_TOOL_ROUNDS - 1:
+                                log.info("Ollama fallback: re-emitted tool '%s' — executing", _rc3["name"])
+                                _rr3 = await self._execute_skill(_rc3["name"], _rc3["args"])
+                                session.messages.append({"role": "user", "content":
+                                    f"[Result of skill '{_rc3['name']}']\n"
+                                    f"{json.dumps(_rr3, indent=2, default=str)}\n\n"
+                                    f"Now answer the user's question. Do NOT call any more tools."})
+                                continue
+                            break
+                        if not response_text:
+                            response_text = (
+                                "I found the information but had trouble formatting the "
+                                "response. Here is what the skill returned:\n\n"
+                                + json.dumps(skill_result, indent=2, default=str)[:3000]
+                            )
+                        yield response_text
+                        session.messages.append({"role": "assistant", "content": response_text,
+                                                 "_ts": datetime.now(timezone.utc).isoformat()})
+                        session.exchange_count += 1
+                        self._sessions.save(session)
+                        return
+
+                response_text = _clean_llm_response(first_content)
+                if response_text:
+                    yield response_text
+
+        except CDCNLLMError as exc:
+            log.error("LLM error in handle_message for user=%s: %s", user_id, exc)
+            error_msg = (
+                "I encountered an error reaching the language model. "
+                "Please try again in a moment."
+            )
+            yield error_msg
+            response_text = f"[LLM ERROR: {exc}]"
+
+        # ── 9. Persist session ─────────────────────────────────────────────────
+        if response_text:
+            session.messages.append(
+                {"role": "assistant", "content": response_text,
+                 "_ts": datetime.now(timezone.utc).isoformat()}
+            )
+        session.exchange_count += 1
+        self._sessions.save(session)
+
+        # ── Memory consolidation every 10 exchanges ───────────────────────────
+        if session.exchange_count > 0 and session.exchange_count % 10 == 0:
+            asyncio.create_task(
+                self._consolidate_memory(session),
+                name=f"consolidate-{session.session_id}-{session.exchange_count}",
+            )
+
+    # ── Injection detection ───────────────────────────────────────────────────
+
+    def _is_injection(self, message: str) -> bool:
+        return any(p.search(message) for p in _INJECTION_PATTERNS)
+
+    # ── Identity linking helpers ─────────────────────────────────────────────
+
+    def _find_matching_web_user(self, display_name: str) -> str | None:
+        """
+        Check if a Discord display name matches a known web user.
+
+        Returns the web username if a match is found, None otherwise.
+        Compares against usernames and display_name fields in the user DB
+        using case-insensitive matching.
+        """
+        from app.auth.auth import list_users
+        normalised = display_name.strip().lower()
+        if not normalised:
+            return None
+        first_name = normalised.split()[0]
+
+        for u in list_users():
+            if not u.get("active"):
+                continue
+            uname = (u.get("username") or "").lower()
+            udisp = (u.get("display_name") or "").lower()
+            # Match on username, display_name, or first-name component
+            if normalised in (uname, udisp) or first_name == uname:
+                return u["username"]
+        return None
+
+    # ── System prompt (cached) ────────────────────────────────────────────────
+
+    async def _get_system_prompt(self, role: str) -> str:
+        """
+        Return a system prompt for the given role.
+
+        The prompt is assembled from:
+          - memory_skill.get_system_prompt() — soul, style guide, agent context
+          - _build_skills_block()             — skill listing in canonical format
+
+        Result is cached for _PROMPT_CACHE_TTL seconds per role to avoid
+        repeated file reads on every turn.
+        """
+        now = time.monotonic()
+        cached = _PROMPT_CACHE.get(role)
+        if cached and (now - cached[1]) < _PROMPT_CACHE_TTL:
+            return cached[0]
+
+        soul_prompt = self.memory_skill.get_system_prompt()
+        skills_block = self._build_skills_block()
+        prompt = f"{soul_prompt}\n\n{skills_block}"
+
+        _PROMPT_CACHE[role] = (prompt, now)
+        return prompt
+
+    def _build_skills_block(self) -> str:
+        """
+        Build the skills listing injected into every system prompt.
+        Simplified for function calling — no raw JSON format instructions needed.
+        """
+        lines = [
+            "## Available Skills",
+            "",
+            "You have access to the following tools/skills via function calling:",
+            "",
+        ]
+        for name, skill in self.skills.items():
+            lines.extend(
+                [
+                    f"- **{name}**: {skill.description}",
+                ]
+            )
+        lines += [
+            "",
+            "Use function calling when a skill is needed. Do not output raw JSON skill calls.",
+        ]
+        return "\n".join(lines)
+
+    def _build_tool_definitions(self) -> list[dict]:
+        """Convert registered skills to OpenAI tool definitions."""
+        tools = []
+        for name, skill in self.skills.items():
+            tool = {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": skill.description,
+                    "parameters": {"type": "object", "properties": {}, "required": []},
+                }
+            }
+            if name == "search" or name == "search_archive":
+                tool["function"]["name"] = "search_archive"
+                tool["function"]["description"] = (
+                    "Search the CDCN document archive. Use this whenever you need to find "
+                    "information from meeting minutes, policies, funding documents, or any "
+                    "other CDCN records."
+                )
+                tool["function"]["parameters"] = {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query — what information are you looking for?"},
+                        "doc_type": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["minutes", "agm_minutes", "policy", "funding", "report", "plan", "agenda", "other"]},
+                            "description": "Filter by document type. Omit to search all types.",
+                        },
+                        "date_from": {"type": "string", "description": "Filter documents from this date (ISO format YYYY-MM-DD)"},
+                        "date_to": {"type": "string", "description": "Filter documents up to this date (ISO format YYYY-MM-DD)"},
+                        "section": {"type": "string", "description": "Filter by section title within documents (e.g. 'DO Update', 'Action Points')"},
+                    },
+                    "required": ["query"],
+                }
+            elif name == "indexer":
+                tool["function"]["parameters"] = {
+                    "type": "object",
+                    "properties": {
+                        "folder": {"type": "string", "description": "Folder to index (optional, uses default)"},
+                        "force": {"type": "boolean", "description": "Force re-index all files"},
+                    },
+                    "required": [],
+                }
+            elif name == "writer":
+                tool["function"]["parameters"] = {
+                    "type": "object",
+                    "properties": {
+                        "template": {"type": "string", "enum": ["funding_application", "board_minute", "governance_policy", "trustees_report"]},
+                        "brief": {"type": "string", "description": "Instructions for the document"},
+                    },
+                    "required": ["template", "brief"],
+                }
+            elif name == "memory":
+                tool["function"]["parameters"] = {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["get_context", "store_summary"]},
+                        "summary": {"type": "string"},
+                    },
+                    "required": ["action"],
+                }
+            elif name == "deadline_tracker":
+                tool["function"]["parameters"] = {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "add", "complete", "overdue"],
+                                   "description": "list=show upcoming, add=create new, complete=mark done, overdue=check overdue"},
+                        "title": {"type": "string", "description": "Deadline title (for add)"},
+                        "category": {"type": "string", "enum": ["funding", "statutory", "policy_review", "contractual", "event", "other"]},
+                        "due_date": {"type": "string", "description": "ISO date YYYY-MM-DD (for add)"},
+                        "assigned_to": {"type": "string"},
+                        "notes": {"type": "string"},
+                        "days_ahead": {"type": "integer", "description": "How many days ahead to look (default 90)"},
+                        "id": {"type": "integer", "description": "Deadline ID (for complete)"},
+                    },
+                    "required": ["action"],
+                }
+            elif name == "action_tracker":
+                tool["function"]["parameters"] = {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "add", "complete"],
+                                   "description": "list=show open actions, add=create new, complete=mark done"},
+                        "description": {"type": "string", "description": "Action description (for add)"},
+                        "assigned_to": {"type": "string"},
+                        "due_date": {"type": "string"},
+                        "meeting_date": {"type": "string"},
+                        "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "action_id": {"type": "string", "description": "Action ID like AP-20260323-001 (for complete)"},
+                        "status": {"type": "string", "enum": ["open", "in_progress", "completed", "deferred", "closed"]},
+                    },
+                    "required": ["action"],
+                }
+            elif name == "meeting_prep":
+                tool["function"]["parameters"] = {
+                    "type": "object",
+                    "properties": {
+                        "meeting_date": {"type": "string", "description": "ISO date YYYY-MM-DD of the meeting"},
+                    },
+                    "required": [],
+                }
+            elif name == "calendar_manager":
+                tool["function"]["parameters"] = {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["month", "upcoming", "add", "update", "delete", "complete"],
+                            "description": "month=get events for a month, upcoming=next N days, add=create event, update=modify, delete=remove, complete=mark done",
+                        },
+                        "year": {"type": "integer", "description": "Year (for month action)"},
+                        "month": {"type": "integer", "description": "Month 1-12 (for month action)"},
+                        "days": {"type": "integer", "description": "Days ahead to look (for upcoming, default 30)"},
+                        "title": {"type": "string", "description": "Event title (for add)"},
+                        "due_date": {"type": "string", "description": "Date YYYY-MM-DD (for add/update)"},
+                        "category": {
+                            "type": "string",
+                            "enum": ["event", "meeting", "funding", "statutory", "policy_review", "contractual", "other"],
+                            "description": "Event category",
+                        },
+                        "event_time": {"type": "string", "description": "Time HH:MM (for add/update)"},
+                        "notes": {"type": "string"},
+                        "assigned_to": {"type": "string"},
+                        "id": {"type": "integer", "description": "Event ID (for update/delete/complete)"},
+                    },
+                    "required": ["action"],
+                }
+            elif name == "document_editor":
+                tool["function"]["parameters"] = {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["read", "save", "list"],
+                            "description": "read=get full document content, save=write content to file, list=browse directory",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path within the document archive (e.g. 'Minutes/report.docx')",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Document content to save (required for action=save)",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Document title — used as heading when saving .docx files",
+                        },
+                        "extension": {
+                            "type": "string",
+                            "description": "Filter by file extension when listing (e.g. '.docx')",
+                        },
+                        "create_backup": {
+                            "type": "boolean",
+                            "description": "Create a .bak backup before overwriting (default true)",
+                        },
+                    },
+                    "required": ["action"],
+                }
+            tools.append(tool)
+        return tools
+
+    # ── Prefetch cache ────────────────────────────────────────────────────────
+
+    def _check_prefetch(self, message: str) -> str:
+        """
+        Scan prefetch_cache.md for sections whose keywords overlap with the
+        incoming message.  Returns the first matching section (up to 600 chars)
+        or empty string if nothing is relevant.
+        """
+        cache_path = Path(settings.memory_path) / "prefetch_cache.md"
+        if not cache_path.exists():
+            return ""
+        try:
+            content = cache_path.read_text()
+        except OSError:
+            return ""
+
+        # Meaningful words only (skip short stop-words)
+        query_words = {w.lower() for w in message.split() if len(w) > 4}
+        if not query_words:
+            return ""
+
+        for section in content.split("## Q:"):
+            section_lower = section.lower()
+            if any(w in section_lower for w in query_words):
+                return section.strip()[:600]
+
+        return ""
+
+    # ── Skill execution ───────────────────────────────────────────────────────
+
+    def _parse_skill_call(self, text: str) -> dict | None:
+        """
+        Extract the first skill-call JSON object from a fenced code block.
+
+        Returns None if no valid skill call is found.
+        """
+        match = _SKILL_CALL_RE.search(text)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(1))
+            if isinstance(data, dict) and "skill" in data:
+                return data
+        except json.JSONDecodeError as exc:
+            log.debug("Skill JSON parse failed: %s — raw: %s", exc, match.group(1)[:200])
+        return None
+
+    def _parse_xml_tool_call(self, text: str) -> dict | None:
+        """
+        Parse a GLM-5-style XML tool call from the content field.
+
+        Returns {"name": str, "args": dict} or None.
+        """
+        match = _XML_TOOL_CALL_RE.search(text)
+        if not match:
+            return None
+        skill_name = match.group(1).strip()
+        if not skill_name:
+            return None
+        args: dict[str, str] = {}
+        for arg_match in _XML_ARG_RE.finditer(match.group(2)):
+            args[arg_match.group(1).strip()] = arg_match.group(2).strip()
+        log.debug("Parsed XML tool call: skill=%s args=%s", skill_name, args)
+        return {"name": skill_name, "args": args}
+
+    async def _execute_skill(self, skill_name: str, args: dict) -> dict:
+        """
+        Dispatch to the named skill.  Always returns a dict — never raises.
+        Unknown / failed skills return an error dict the LLM can explain.
+        Maps search_archive → search skill.
+        """
+        # Map search_archive tool name to search skill
+        actual_name = "search" if skill_name == "search_archive" else skill_name
+        skill = self.skills.get(actual_name)
+        if not skill:
+            log.warning("LLM requested unknown skill: %s", skill_name)
+            return {
+                "success": False,
+                "error": f"Skill '{skill_name}' is not available.",
+                "output": None,
+            }
+        try:
+            result = await skill.run(**args)
+
+            # ── Verification step for search results ─────────────────────────
+            # For search_archive results, add citation reminders
+            output = result.output
+            metadata = result.metadata if hasattr(result, "metadata") else {}
+            if actual_name == "search" and result.success and output:
+                output = (
+                    output + "\n\n---\n"
+                    "CITATION REQUIREMENT: Every factual claim in your response MUST "
+                    "include a citation in the format [Document Name, Date, Section]. "
+                    "If a claim cannot be supported by the search results above, "
+                    "explicitly mark it as [UNVERIFIED]."
+                )
+
+            return {
+                "success": result.success,
+                "output": output,
+                "error": result.error,
+                "metadata": metadata,
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Skill '%s' raised an exception", skill_name)
+            return {"success": False, "error": str(exc), "output": None, "metadata": {}}
+
+    # ── Response verification ────────────────────────────────────────────────
+
+    async def _verify_response(self, response: str, context_messages: list[dict]) -> str:
+        """
+        Verify that every factual claim in the response has a citation.
+        If verification fails, returns corrected response with [UNVERIFIED] tags.
+        This is mandatory for CDCN — a registered charity where incorrect
+        governance/financial information has real consequences.
+        """
+        try:
+            verify_messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        f"{_VERIFICATION_PROMPT}\n\n"
+                        f"RESPONSE TO VERIFY:\n{response}"
+                    ),
+                }
+            ]
+            verified = await self.llm.chat(
+                verify_messages,
+                system_prompt=(
+                    "You are a citation verification assistant for CDCN, a Scottish charity. "
+                    "Your ONLY job is to check that factual claims have proper citations. "
+                    "Return the response with [UNVERIFIED] tags where needed, or unchanged if OK."
+                ),
+                skill_used="verification",
+            )
+            if verified and verified.strip():
+                log.info("Verification complete: %d chars input → %d chars output",
+                         len(response), len(verified))
+                return verified.strip()
+        except Exception as exc:
+            log.warning("Verification step failed: %s — returning unverified response", exc)
+        return response
+
+    # ── Memory consolidation ──────────────────────────────────────────────────
+
+    async def _consolidate_memory(self, session: Session) -> None:
+        """
+        Ask the LLM to summarise the last 20 messages into key facts and
+        action items, then store them via memory_skill.
+
+        Runs as a background Task — failures are logged, never propagated.
+        """
+        log.info(
+            "Memory consolidation triggered: session=%s exchange=%d",
+            session.session_id,
+            session.exchange_count,
+        )
+        try:
+            recent = session.messages[-20:]
+            transcript = "\n".join(
+                f"{m['role'].upper()}: {str(m.get('content', ''))[:400]}"
+                for m in recent
+            )
+            summary_messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        "Summarise the following conversation into a concise bullet-point "
+                        "list of key facts, decisions, and action items for future reference:\n\n"
+                        f"{transcript}"
+                    ),
+                }
+            ]
+            summary = await self.llm.chat(
+                summary_messages,
+                system_prompt=(
+                    "You are a helpful assistant summarising a conversation "
+                    "for long-term memory storage. Be concise and factual."
+                ),
+            )
+            await self.memory_skill.run(
+                action="store_summary",
+                summary=summary,
+                session_id=session.session_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("Memory consolidation failed for session %s: %s", session.session_id, exc)
+
+
+# ── Singleton factory ─────────────────────────────────────────────────────────
+
+_router_instance: AgentRouter | None = None
+
+
+def set_router_instance(router: AgentRouter) -> None:
+    """
+    Register the fully-constructed AgentRouter singleton.
+    Called once from main.py after all dependencies are wired.
+    """
+    global _router_instance
+    _router_instance = router
+
+
+def _get_agent_router() -> AgentRouter:
+    """
+    Return the pre-registered singleton.  Falls back to building a minimal
+    router (without DreamWorkerSkill) if called before main.py has run —
+    this only happens during unit tests or early startup edge cases.
+    """
+    global _router_instance
+    if _router_instance is not None:
+        return _router_instance
+
+    from app.skills.indexer import IndexerSkill
+    from app.skills.memory import MemorySkill
+    from app.skills.search import SearchSkill
+    from app.skills.writer import WriterSkill
+    from app.skills.skill_builder import SkillBuilderSkill
+    from app.skills.deadline_tracker import DeadlineTrackerSkill
+    from app.skills.action_tracker import ActionTrackerSkill
+    from app.skills.meeting_prep import MeetingPrepSkill
+
+    memory_skill = MemorySkill()
+    skills: dict[str, BaseSkill] = {
+        "search": SearchSkill(),
+        "indexer": IndexerSkill(),
+        "writer": WriterSkill(),
+        "skill_builder": SkillBuilderSkill(),
+        "memory": memory_skill,
+        "deadline_tracker": DeadlineTrackerSkill(),
+        "action_tracker": ActionTrackerSkill(),
+        "meeting_prep": MeetingPrepSkill(),
+    }
+    _router_instance = AgentRouter(
+        skills=skills,
+        llm=llm_client,
+        memory_skill=memory_skill,
+    )
+    return _router_instance
+
+
+# ── FastAPI router ────────────────────────────────────────────────────────────
+# gateway_router is imported by main.py and mounted at /api.
+
+gateway_router = APIRouter()
+
+
+# ── /chat ─────────────────────────────────────────────────────────────────────
+
+
+class ChatRequest(BaseModel):
+    message: str
+    user_id: str = ""
+    role: str = "user"
+    channel_id: str = ""
+
+
+@gateway_router.post("/chat", tags=["agent"])
+async def chat_endpoint(
+    body: ChatRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Stream a response from the agent.
+
+    Internally runs the full agentic loop:
+    injection guard → session → skill detection → LLM → persist.
+    """
+    agent = _get_agent_router()
+    uid = body.user_id or current_user.username
+
+    async def _stream():
+        async for token in agent.handle_message(
+            user_id=uid,
+            role=body.role,
+            message=body.message,
+            channel_id=body.channel_id,
+        ):
+            yield token
+
+    return StreamingResponse(_stream(), media_type="text/plain; charset=utf-8")
+
+
+# ── /status ───────────────────────────────────────────────────────────────────
+
+
+@gateway_router.get("/status", tags=["gateway"])
+async def gateway_status():
+    return state.status()
+
+
+# ── Session HTTP endpoints ────────────────────────────────────────────────────
+
+
+@gateway_router.get("/sessions", tags=["sessions"])
+async def list_sessions(current_user: User = Depends(get_current_user)):
+    """List today's sessions."""
+    manager = SessionManager()
+    sessions = manager.get_today_sessions()
+    return [
+        {
+            "session_id": s.session_id,
+            "user_id": s.user_id,
+            "role": s.role,
+            "exchange_count": s.exchange_count,
+            "created_at": s.created_at,
+            "last_active": s.last_active,
+        }
+        for s in sessions
+    ]
+
+
+@gateway_router.get("/sessions/{session_id}", tags=["sessions"])
+async def get_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Return one session by ID (today's sessions only)."""
+    manager = SessionManager()
+    for s in manager.get_today_sessions():
+        if s.session_id == session_id:
+            return s
+    raise HTTPException(status_code=404, detail="Session not found")

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(*\\)\nRead\\(*\\)\nWrite\\(*)",
+      "Bash(.venv/bin/python -c \"from app.skills.indexer import DocumentIndexerSkill, _extract_date_from_filename, _infer_doc_type; print\\('Import OK'\\)\")",
+      "Bash(.venv/bin/python - <<'EOF'\nfrom app.skills.indexer import _extract_date_from_filename, _infer_doc_type\n\nfiles = [\n    \"aald_skul_nesting_business_plan_final_version_nov_2017.pdf\",\n    \"Agenda CDCN Meeting  18-3-26.pdf\",\n    \"board_minute_20260322_1442.docx\",\n    \"CDCN Draft Meeting Agenda 19-08-25.docx\",\n    \"CDCN Draft Meeting Minutes 02.09.25.docx\",\n    \"CDCN Draft Meeting Minutes 05-08-2025.docx\",\n    \"CDCN Meeting Minutes 10-06-2025.pdf\",\n    \"CDCN Meeting corrected 18_3_25.pdf\",\n    \"CDCN Meeting notes 08_4_25 Rev2.pdf\",\n    \"CDCN Meeting notes 20_05_2025 Rev 1 copy.pdf\",\n    \"CDCN Minutes 04_02_2025.pdf\",\n    \"CDCN Minutes 04-02-25_signed.pdf\",\n    \"CDCN minutes \\(1\\) 20-01-26.pdf\",\n    \"CDCN minutes \\(2\\) 10-2-26.pdf\",\n    \"Draft \\(2\\) CDCN AGM Minutes - 11.11.2025.pdf\",\n    \"Draft CDCN Meeting Minutes 10.09.25.pdf\",\n    \"cdcn_agm_minutes_19th_nov_2024 draft.pdf\",\n    \"CDCN Artificial Intelligence \\(AI\\) and Ethics Policy v2.0 \\(2026.27\\).pdf\",\n    \"funding_application_20260322_1418.docx\",\n    \"HIE D.O. Grant Funding Meeting - 06-03-2026.pdf\",\n    \"Nesting Girlsta and Wadbister Community Action Plan 2024.pdf\",\n    \"Trustee Report - 2024-25 - Draft-1 MR v0.2.docx\",\n    \"trustees_report_20260322_1822.docx\",\n]\n\nprint\\(f\"{'Filename':<55} {'Type':<12} {'Date'}\"\\)\nprint\\(\"-\" * 90\\)\nfor f in files:\n    print\\(f\"{f[:54]:<55} {_infer_doc_type\\(f\\):<12} {_extract_date_from_filename\\(f\\)}\"\\)\nEOF)",
+      "Bash(.venv/bin/python - <<'EOF'\nfrom app.skills.indexer import _extract_date_from_filename, _infer_doc_type\n\ntricky = [\n    \"cdcn_agm_minutes_19th_nov_2024 draft.pdf\",\n    \"CDCN Meeting corrected 18_3_25.pdf\",\n    \"CDCN Meeting notes 08_4_25 Rev2.pdf\",\n    \"CDCN Meeting notes 20_05_2025 Rev 1 copy.pdf\",\n]\nfor f in tricky:\n    print\\(f\"{f:<55} {_infer_doc_type\\(f\\):<12} {_extract_date_from_filename\\(f\\)}\"\\)\nEOF)",
+      "Bash(.venv/bin/python - <<'EOF'\nimport asyncio\nfrom app.skills.indexer import DocumentIndexerSkill\n\nasync def main\\(\\):\n    skill = DocumentIndexerSkill\\(\\)\n    result = await skill.build_metadata_db\\(\\)\n    print\\(result.output\\)\n\nasyncio.run\\(main\\(\\)\\)\nEOF)",
+      "Bash(sqlite3:*)"
+    ]
+  }
+}
